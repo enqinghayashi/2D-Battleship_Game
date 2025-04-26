@@ -1,1 +1,1 @@
-# CITS3002_BEER
+# CITS3002 BEER Project
