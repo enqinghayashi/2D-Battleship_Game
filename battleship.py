@@ -357,6 +357,94 @@ def run_single_player_game_online(rfile, wfile):
         except ValueError as e:
             send(f"Invalid input: {e}")
 
+def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
+    """
+    Runs a two-player online Battleship game.
+    Each player takes turns firing at the other.
+    Ships are placed randomly for both players.
+
+    - rfile1, wfile1: read/write file-like objects for Player 1
+    - rfile2, wfile2: read/write file-like objects for Player 2
+    """
+    def send(wfile, msg):
+        wfile.write(msg + '\n')
+        wfile.flush()
+
+    def send_board(wfile, board):
+        wfile.write("GRID\n")
+        wfile.write("   " + " ".join(f"{i+1:2}" for i in range(board.size)) + '\n')
+        for r in range(board.size):
+            row_label = chr(ord('A') + r)
+            row_str = " ".join(board.display_grid[r][c] for c in range(board.size))
+            wfile.write(f"{row_label:2} {row_str}\n")
+        wfile.write('\n')
+        wfile.flush()
+
+    def recv(rfile):
+        return rfile.readline().strip()
+
+    board1 = Board(BOARD_SIZE)
+    board2 = Board(BOARD_SIZE)
+    board1.place_ships_randomly(SHIPS)
+    board2.place_ships_randomly(SHIPS)
+    send(wfile1, "Welcome Player 1! You are playing Battleship against Player 2.")
+    send(wfile2, "Welcome Player 2! You are playing Battleship against Player 1.")
+
+    moves = 0
+    turn = 0  # 0 for Player 1's turn, 1 for Player 2's
+
+    while True:
+        if turn == 0:
+            rfile, wfile = rfile1, wfile1
+            opponent_wfile = wfile2
+            opponent_board = board2
+            player_num = 1
+        else:
+            rfile, wfile = rfile2, wfile2
+            opponent_wfile = wfile1
+            opponent_board = board1
+            player_num = 2
+
+        send_board(wfile, opponent_board)
+        send(wfile, f"Player {player_num}, enter coordinate to fire at (e.g., B5), or 'quit' to exit:")
+        send(opponent_wfile, f"Waiting for Player {player_num} to make a move...")
+        guess = recv(rfile)
+        if guess.lower() == 'quit':
+            send(wfile, "You quit. Game over.")
+            send(opponent_wfile, f"Player {player_num} quit. Game over.")
+            break
+        try:
+            row, col = parse_coordinate(guess)
+            result, sunk_name = opponent_board.fire_at(row, col)
+            moves += 1
+            if result == 'already_shot':
+                send(wfile, "You've already fired at that location. Try again.")
+                continue
+            if result == 'hit':
+                if sunk_name:
+                    send(wfile, f"HIT! You sank the {sunk_name}!")
+                    send(opponent_wfile, f"Your {sunk_name} was sunk!")
+                else:
+                    send(wfile, "HIT!")
+                    send(opponent_wfile, "Your ship was hit!")
+                if opponent_board.all_ships_sunk():
+                    send_board(wfile, opponent_board)
+                    send_board(opponent_wfile, opponent_board)
+                    send(wfile, f"Congratulations! You sank all opponent ships in {moves} moves. You win!")
+                    send(opponent_wfile, "All your ships have been sunk. You lose.")
+                    break
+            elif result == 'miss':
+                send(wfile, "MISS!")
+                send(opponent_wfile, "Opponent missed!")
+
+            # Switch turns for players
+            turn = 1 - turn
+
+        except ValueError as e:
+            send(wfile, f"Invalid input: {e}")
+            continue
+
+
 if __name__ == "__main__":
     # Optional: run this file as a script to test single-player mode
     run_single_player_game_locally()
