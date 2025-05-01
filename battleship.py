@@ -244,6 +244,41 @@ def parse_coordinate(coord_str):
     return (row, col)
 
 
+def format_result_message(result, sunk_name=None):
+    """
+    Format the result of a FIRE command as a protocol message.
+    """
+    if result == 'hit':
+        if sunk_name:
+            return f"RESULT HIT SUNK {sunk_name.upper()}"
+        else:
+            return "RESULT HIT"
+    elif result == 'miss':
+        return "RESULT MISS"
+    elif result == 'already_shot':
+        return "RESULT ALREADY_SHOT"
+    else:
+        return "RESULT ERROR"
+
+def parse_fire_message(msg):
+    """
+    Parse a FIRE message, e.g. 'FIRE B5' -> ('FIRE', 'B5')
+    """
+    parts = msg.strip().split()
+    if len(parts) == 2 and parts[0].upper() == 'FIRE':
+        return parts[1]
+    raise ValueError("Invalid FIRE message format")
+
+def parse_place_message(msg):
+    """
+    Parse a PLACE message, e.g. 'PLACE A1 H BATTLESHIP'
+    """
+    parts = msg.strip().split()
+    if len(parts) == 4 and parts[0].upper() == 'PLACE':
+        return parts[1], parts[2].upper(), parts[3].upper()
+    raise ValueError("Invalid PLACE message format")
+
+
 def run_single_player_game_locally():
     """
     A test harness for local single-player mode, demonstrating two approaches:
@@ -296,14 +331,7 @@ def run_single_player_game_locally():
 def run_single_player_game_online(rfile, wfile):
     """
     A test harness for running the single-player game with I/O redirected to socket file objects.
-    Expects:
-      - rfile: file-like object to .readline() from client
-      - wfile: file-like object to .write() back to client
-    
-    #####
-    NOTE: This function is (intentionally) currently somewhat "broken", which will be evident if you try and play the game via server/client.
-    You can use this as a starting point, or write your own.
-    #####
+    Uses minimal protocol messages: FIRE <coord>, RESULT <result>, etc.
     """
     def send(msg):
         wfile.write(msg + '\n')
@@ -325,46 +353,35 @@ def run_single_player_game_online(rfile, wfile):
     board = Board(BOARD_SIZE)
     board.place_ships_randomly(SHIPS)
 
-    send("Welcome to Online Single-Player Battleship! Try to sink all the ships. Type 'quit' to exit.")
-
+    send("WELCOME")
     moves = 0
     while True:
         send_board(board)
-        send("Enter coordinate to fire at (e.g. B5):")
-        guess = recv()
-        if guess.lower() == 'quit':
-            send("Thanks for playing. Goodbye.")
+        send("READY")  # Prompt client to FIRE
+        msg = recv()
+        if msg.lower() == 'quit':
+            send("BYE")
             return
-
         try:
-            row, col = parse_coordinate(guess)
+            coord = parse_fire_message(msg)
+            row, col = parse_coordinate(coord)
             result, sunk_name = board.fire_at(row, col)
             moves += 1
+            send(format_result_message(result, sunk_name))
+            if result == 'hit' and board.all_ships_sunk():
+                send_board(board)
+                send(f"WIN {moves}")
+                return
+        except Exception as e:
+            send(f"ERROR {e}")
 
-            if result == 'hit':
-                if sunk_name:
-                    send(f"HIT! You sank the {sunk_name}!")
-                else:
-                    send("HIT!")
-                if board.all_ships_sunk():
-                    send_board(board)
-                    send(f"Congratulations! You sank all ships in {moves} moves.")
-                    return
-            elif result == 'miss':
-                send("MISS!")
-            elif result == 'already_shot':
-                send("You've already fired at that location.")
-        except ValueError as e:
-            send(f"Invalid input: {e}")
 
 def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
     """
     Runs a two-player online Battleship game.
-    Each player takes turns firing at the other.
-    Ships are placed randomly for both players.
-
-    - rfile1, wfile1: read/write file-like objects for Player 1
-    - rfile2, wfile2: read/write file-like objects for Player 2
+    Each player places ships, then takes turns firing at the other.
+    Reports hit/miss/sunk, ends when one player has all ships sunk or forfeits.
+    Uses minimal protocol messages: PLACE, FIRE, RESULT, WIN, etc.
     """
     def send(wfile, msg):
         wfile.write(msg + '\n')
@@ -385,10 +402,46 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
 
     board1 = Board(BOARD_SIZE)
     board2 = Board(BOARD_SIZE)
-    board1.place_ships_randomly(SHIPS)
-    board2.place_ships_randomly(SHIPS)
-    send(wfile1, "Welcome Player 1! You are playing Battleship against Player 2.")
-    send(wfile2, "Welcome Player 2! You are playing Battleship against Player 1.")
+    send(wfile1, "WELCOME PLAYER 1")
+    send(wfile2, "WELCOME PLAYER 2")
+    send(wfile1, "PLACE_SHIPS")
+    send(wfile2, "PLACE_SHIPS")
+
+    for board, rfile, wfile, player_num in [
+        (board1, rfile1, wfile1, 1),
+        (board2, rfile2, wfile2, 2)
+    ]:
+        for ship_name, ship_size in SHIPS:
+            while True:
+                send(wfile, f"PLACE {ship_name}(shipName) {ship_size}(shipSize) ")
+                send(wfile, f"Respond something like PLACE <COORD> <ORIENTATION> <SHIPNAME> ")
+                send(wfile, f"e.g. 'place b6 v battleship' v:vertical, h: horizontal ")
+                msg = recv(rfile)
+                try:
+                    coord_str, orientation_str, name = parse_place_message(msg)
+                    if name != ship_name.upper():
+                        send(wfile, "ERROR Ship name mismatch")
+                        continue
+                    row, col = parse_coordinate(coord_str)
+                    orientation = 0 if orientation_str == 'H' else 1 if orientation_str == 'V' else None
+                    if orientation is None:
+                        send(wfile, "ERROR Invalid orientation")
+                        continue
+                    if board.can_place_ship(row, col, ship_size, orientation):
+                        occupied_positions = board.do_place_ship(row, col, ship_size, orientation)
+                        board.placed_ships.append({
+                            'name': ship_name,
+                            'positions': occupied_positions
+                        })
+                        send(wfile, "PLACED")
+                        break
+                    else:
+                        send(wfile, "ERROR Cannot place ship at that location")
+                except Exception as e:
+                    send(wfile, f"ERROR {e}")
+
+    send(wfile1, "ALL_SHIPS_PLACED")
+    send(wfile2, "ALL_SHIPS_PLACED")
 
     moves = 0
     turn = 0  # 0 for Player 1's turn, 1 for Player 2's
@@ -406,42 +459,42 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
             player_num = 2
 
         send_board(wfile, opponent_board)
-        send(wfile, f"Player {player_num}, enter coordinate to fire at (e.g., B5), or 'quit' to exit:")
-        send(opponent_wfile, f"Waiting for Player {player_num} to make a move...")
-        guess = recv(rfile)
-        if guess.lower() == 'quit':
-            send(wfile, "You quit. Game over.")
-            send(opponent_wfile, f"Player {player_num} quit. Game over.")
+        send(wfile, "READY")
+        send(opponent_wfile, "WAITING")
+        msg = recv(rfile)
+        if msg.lower() == 'quit':
+            send(wfile, "BYE")
+            send(opponent_wfile, "OPPONENT_QUIT")
             break
         try:
-            row, col = parse_coordinate(guess)
+            coord = parse_fire_message(msg)
+            row, col = parse_coordinate(coord)
             result, sunk_name = opponent_board.fire_at(row, col)
             moves += 1
-            if result == 'already_shot':
-                send(wfile, "You've already fired at that location. Try again.")
-                continue
+            send(wfile, format_result_message(result, sunk_name))
             if result == 'hit':
                 if sunk_name:
-                    send(wfile, f"HIT! You sank the {sunk_name}!")
-                    send(opponent_wfile, f"Your {sunk_name} was sunk!")
+                    send(wfile, f"SUNK {sunk_name.upper()}")
+                    send(opponent_wfile, f"YOUR_SHIP_SUNK {sunk_name.upper()}")
                 else:
-                    send(wfile, "HIT!")
-                    send(opponent_wfile, "Your ship was hit!")
+                    send(wfile, "HIT")
+                    send(opponent_wfile, "YOUR_SHIP_HIT")
                 if opponent_board.all_ships_sunk():
                     send_board(wfile, opponent_board)
                     send_board(opponent_wfile, opponent_board)
-                    send(wfile, f"Congratulations! You sank all opponent ships in {moves} moves. You win!")
-                    send(opponent_wfile, "All your ships have been sunk. You lose.")
+                    send(wfile, f"WIN {moves}")
+                    send(opponent_wfile, "LOSE")
                     break
             elif result == 'miss':
-                send(wfile, "MISS!")
-                send(opponent_wfile, "Opponent missed!")
-
+                send(wfile, "MISS")
+                send(opponent_wfile, "OPPONENT_MISS")
+            elif result == 'already_shot':
+                send(wfile, "ALREADY_SHOT")
+                continue
             # Switch turns for players
             turn = 1 - turn
-
-        except ValueError as e:
-            send(wfile, f"Invalid input: {e}")
+        except Exception as e:
+            send(wfile, f"ERROR {e}")
             continue
 
 
