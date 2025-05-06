@@ -500,7 +500,7 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
                 send(wfile, "ERROR Invalid FIRE command format. Use 'FIRE A5'")
                 continue
 
-            # 检查坐标合法性（例如不能是 Z11 或 0A）
+            # validate the coordinates
             if len(coord) < 2 or not coord[0].isalpha() or not coord[1:].isdigit():
                 send(wfile, f"ERROR Invalid coordinate format: {coord}")
                 continue
