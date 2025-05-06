@@ -227,7 +227,6 @@ class Board:
             row_str = " ".join(grid_to_print[r][c] for c in range(self.size))
             print(f"{row_label:2} {row_str}")
 
-
 def parse_coordinate(coord_str):
     """
     Convert something like 'B5' into zero-based (row, col).
@@ -235,11 +234,21 @@ def parse_coordinate(coord_str):
     HINT: you might want to add additional input validation here...
     """
     coord_str = coord_str.strip().upper()
+
+    if len(coord_str) < 2:
+        raise ValueError("Coordinate too short")
+
     row_letter = coord_str[0]
     col_digits = coord_str[1:]
 
+    if not row_letter.isalpha() or not col_digits.isdigit():
+        raise ValueError("Invalid coordinate format")
+
     row = ord(row_letter) - ord('A')
     col = int(col_digits) - 1  # zero-based
+
+    if row < 0 or row >= BOARD_SIZE or col < 0 or col >= BOARD_SIZE:
+        raise ValueError(f"Coordinate out of bounds: {coord_str}")
 
     return (row, col)
 
@@ -386,6 +395,17 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
     def send(wfile, msg):
         wfile.write(msg + '\n')
         wfile.flush()
+        
+    def send_my_board(wfile, board):
+        wfile.write("OWN_BOARD\n")
+        wfile.write("   " + " ".join(f"{i+1:2}" for i in range(board.size)) + '\n')
+        for r in range(board.size):
+            row_label = chr(ord('A') + r)
+            row_str = " ".join(board.hidden_grid[r][c] for c in range(board.size))
+            wfile.write(f"{row_label:2} {row_str}\n")
+        wfile.write('\n')
+        wfile.flush()
+
 
     def send_board(wfile, board):
         wfile.write("GRID\n")
@@ -452,24 +472,45 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
             opponent_wfile = wfile2
             opponent_board = board2
             player_num = 1
+            player_board = board1
         else:
             rfile, wfile = rfile2, wfile2
             opponent_wfile = wfile1
             opponent_board = board1
             player_num = 2
-
+            player_board = board2
+            
+        send_my_board(wfile, player_board)
         send_board(wfile, opponent_board)
         send(wfile, "READY")
         send(opponent_wfile, "WAITING")
+        
         msg = recv(rfile)
         if msg.lower() == 'quit':
             send(wfile, "BYE")
             send(opponent_wfile, "OPPONENT_QUIT")
             break
+        
+        
+        
         try:
-            coord = parse_fire_message(msg)
+            try:
+                coord = parse_fire_message(msg)
+            except ValueError:
+                send(wfile, "ERROR Invalid FIRE command format. Use 'FIRE A5'")
+                continue
+
+            # validate the coordinates
+            if len(coord) < 2 or not coord[0].isalpha() or not coord[1:].isdigit():
+                send(wfile, f"ERROR Invalid coordinate format: {coord}")
+                continue
+
             row, col = parse_coordinate(coord)
-            result, sunk_name = opponent_board.fire_at(row, col)
+            if not (0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE):
+                send(wfile, f"ERROR Coordinate out of range: {coord}")
+                continue
+            
+            result, sunk_name = opponent_board.fire_at(row, col)       
             moves += 1
             send(wfile, format_result_message(result, sunk_name))
             if result == 'hit':
