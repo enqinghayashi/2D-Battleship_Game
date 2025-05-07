@@ -343,21 +343,30 @@ def run_single_player_game_online(rfile, wfile):
     Uses minimal protocol messages: FIRE <coord>, RESULT <result>, etc.
     """
     def send(msg):
-        wfile.write(msg + '\n')
-        wfile.flush()
-
+        try:
+            wfile.write(msg + '\n')
+            wfile.flush()
+        except Exception:
+            raise ConnectionError("Player disconnected from the game") 
     def send_board(board):
-        wfile.write("GRID\n")
-        wfile.write("  " + " ".join(str(i + 1).rjust(2) for i in range(board.size)) + '\n')
-        for r in range(board.size):
-            row_label = chr(ord('A') + r)
-            row_str = " ".join(board.display_grid[r][c] for c in range(board.size))
-            wfile.write(f"{row_label:2} {row_str}\n")
-        wfile.write('\n')
-        wfile.flush()
-
+        try:
+            wfile.write("GRID\n")
+            wfile.write("  " + " ".join(str(i + 1).rjust(2) for i in range(board.size)) + '\n')
+            for r in range(board.size):
+                row_label = chr(ord('A') + r)
+                row_str = " ".join(board.display_grid[r][c] for c in range(board.size))
+                wfile.write(f"{row_label:2} {row_str}\n")
+            wfile.write('\n')
+            wfile.flush()
+        except Exception:
+            raise ConnectionError("Player disconnected from the game") 
+        
     def recv():
-        return rfile.readline().strip()
+        try:
+            if rfile.readline().strip():
+                return rfile.readline().strip()
+        except Exception:
+            raise ConnectionError("Player disconnected from the game")
 
     board = Board(BOARD_SIZE)
     board.place_ships_randomly(SHIPS)
@@ -393,32 +402,42 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
     Uses minimal protocol messages: PLACE, FIRE, RESULT, WIN, etc.
     """
     def send(wfile, msg):
-        wfile.write(msg + '\n')
-        wfile.flush()
-        
+        try:
+            wfile.write(msg + '\n')
+            wfile.flush()
+        except Exception:
+            raise ConnectionError("Opponent disconnected from the game")
     def send_my_board(wfile, board):
-        wfile.write("OWN_BOARD\n")
-        wfile.write("   " + " ".join(f"{i+1:2}" for i in range(board.size)) + '\n')
-        for r in range(board.size):
-            row_label = chr(ord('A') + r)
-            row_str = " ".join(board.hidden_grid[r][c] for c in range(board.size))
-            wfile.write(f"{row_label:2} {row_str}\n")
-        wfile.write('\n')
-        wfile.flush()
-
+        try:
+            wfile.write("OWN_BOARD\n")
+            wfile.write("   " + " ".join(f"{i+1:2}" for i in range(board.size)) + '\n')
+            for r in range(board.size):
+                row_label = chr(ord('A') + r)
+                row_str = " ".join(board.hidden_grid[r][c] for c in range(board.size))
+                wfile.write(f"{row_label:2} {row_str}\n")
+            wfile.write('\n')
+            wfile.flush()
+        except Exception:
+            raise ConnectionError("Opponent disconnected from the game")
 
     def send_board(wfile, board):
-        wfile.write("GRID\n")
-        wfile.write("   " + " ".join(f"{i+1:2}" for i in range(board.size)) + '\n')
-        for r in range(board.size):
-            row_label = chr(ord('A') + r)
-            row_str = " ".join(board.display_grid[r][c] for c in range(board.size))
-            wfile.write(f"{row_label:2} {row_str}\n")
-        wfile.write('\n')
-        wfile.flush()
-
-    def recv(rfile):
-        return rfile.readline().strip()
+        try:
+            wfile.write("GRID\n")
+            wfile.write("   " + " ".join(f"{i+1:2}" for i in range(board.size)) + '\n')
+            for r in range(board.size):
+                row_label = chr(ord('A') + r)
+                row_str = " ".join(board.display_grid[r][c] for c in range(board.size))
+                wfile.write(f"{row_label:2} {row_str}\n")
+            wfile.write('\n')
+            wfile.flush()
+        except Exception:
+            raise ConnectionError("Opponent disconnected from the game")
+    def recv():
+        try:
+            if rfile.readline().strip():
+                return rfile.readline().strip()
+        except Exception:
+            raise ConnectionError("Opponent disconnected from the game")
 
     board1 = Board(BOARD_SIZE)
     board2 = Board(BOARD_SIZE)
