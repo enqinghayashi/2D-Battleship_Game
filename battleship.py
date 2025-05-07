@@ -432,12 +432,14 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
             wfile.flush()
         except Exception:
             raise ConnectionError("Opponent disconnected from the game")
-    def recv():
-        try:
-            if rfile.readline().strip():
-                return rfile.readline().strip()
-        except Exception:
+def safe_recv(rfile):
+    try:
+        line = rfile.readline()
+        if not line:
             raise ConnectionError("Opponent disconnected from the game")
+        return line.strip()
+    except Exception:
+        raise ConnectionError("Opponent disconnected from the game")
 
     board1 = Board(BOARD_SIZE)
     board2 = Board(BOARD_SIZE)
@@ -455,7 +457,7 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
                 send(wfile, f"PLACE {ship_name}(shipName) {ship_size}(shipSize) ")
                 send(wfile, f"Respond something like PLACE <COORD> <ORIENTATION> <SHIPNAME> ")
                 send(wfile, f"e.g. 'place b6 v battleship' v:vertical, h: horizontal ")
-                msg = recv(rfile)
+                msg = recv()
                 try:
                     coord_str, orientation_str, name = parse_place_message(msg)
                     if name != ship_name.upper():
