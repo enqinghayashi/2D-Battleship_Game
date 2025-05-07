@@ -19,7 +19,8 @@ PORT = 5000
 
 waiting_lines = []
 waiting_players_lock = threading.Lock() # a lock to thread for needing 2 players to start the game
-
+game_lock = threading.Lock()
+game_running = threading.Event()
 def single_player(conn, addr):
     try:
         rfile = conn.makefile('r')
@@ -32,41 +33,46 @@ def single_player(conn, addr):
         print(f"[INFO] Single player client {addr} connection closed.")
 
 def two_player_game(conn1, addr1, conn2, addr2):
+    global game_running
     try:
         rfile1 = conn1.makefile('r')
         wfile1 = conn1.makefile('w')
         rfile2 = conn2.makefile('r')
         wfile2 = conn2.makefile('w')
-        try:
-            run_two_player_game_online(rfile1, wfile1, rfile2, wfile2)
-        except (ConnectionResetError, BrokenPipeError):
+        game_running.set()
+        run_two_player_game_online(rfile1, wfile1, rfile2, wfile2)
+    except Exception as e:
+        print(f"[ERROR] Exception during game: {e}")
             # One or both players disconnected
-            try:
-                wfile1.write("OPPONENT_DISCONNECTED. YOU WIN!\n")
-                wfile1.flush()
-            except Exception:
-                pass
-            try:
-                wfile2.write("OPPONENT_DISCONNECTED. YOU WIN!\n")
-                wfile2.flush()
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"[WARN] Exception in two-player game: {e}")
-        finally:
+        try:
+            wfile1.write("OPPONENT_DISCONNECTED. YOU WIN!\n")
+            wfile1.flush()
+        except Exception:
+            pass
+        try:
+            wfile2.write("OPPONENT_DISCONNECTED. YOU WIN!\n")
+            wfile2.flush()
+        except Exception:
+            pass
+    finally:
+        try:
             conn1.close()
             conn2.close()
             print(f"[INFO] Two-player game between {addr1} and {addr2} ended.")
-    except Exception as e:
-        print(f"[ERROR] Error in two-player game setup: {e}")
+            game_running.clear()
+        except Exception as e:
+            print(f"[ERROR] Error in two-player game setup: {e}")
 
 def lobby_manager():
     while True:
         with waiting_players_lock:
-            if len(waiting_lines) >= 2:
+            if len(waiting_lines) >= 2 and not game_running.is_set():
                 (conn1, addr1) = waiting_lines.pop(0) # extract players from the line by FIFO
                 (conn2, addr2) = waiting_lines.pop(0)
+                print("[INFO] Starting new two player game.")
                 threading.Thread(target=two_player_game, args=(conn1, addr1, conn2, addr2), daemon=True).start()
+        threading.Event().wait(0.5) # Sleeps the threaded game if no players
+
 def game_manager(conn, addr, mode):
     if mode == "1":
         single_player(conn, addr)
@@ -79,7 +85,7 @@ def game_manager(conn, addr, mode):
             wfile.write("Waiting for another player to join...\n")
             wfile.flush()
         except Exception:
-            pass
+            print(f"[WARN] Failed to notify player at {addr}: {e}")
 
 def main():
     mode = input ("Select mode: (1) Single player, (2) Two player: ").strip()
