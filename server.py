@@ -11,42 +11,93 @@ However, if you want to support multiple clients (i.e. progress through further 
 """
 
 import socket
+import threading
 from battleship import run_single_player_game_online, run_two_player_game_online
 
 HOST = '127.0.0.1'
 PORT = 5000
+
+waiting_lines = []
+waiting_players_lock = threading.Lock() # a lock to thread for needing 2 players to start the game
+
+def single_player(conn, addr):
+    try:
+        rfile = conn.makefile('r')
+        wfile = conn.makefile('w')
+        run_single_player_game_online(rfile, wfile)
+    except Exception as e:
+        print(f"[WARN] Single player client {addr} disconnected: {e}")
+    finally:
+        conn.close()
+        print(f"[INFO] Single player client {addr} connection closed.")
+
+def two_player_game(conn1, addr1, conn2, addr2):
+    try:
+        rfile1 = conn1.makefile('r')
+        wfile1 = conn1.makefile('w')
+        rfile2 = conn2.makefile('r')
+        wfile2 = conn2.makefile('w')
+        try:
+            run_two_player_game_online(rfile1, wfile1, rfile2, wfile2)
+        except (ConnectionResetError, BrokenPipeError):
+            # One or both players disconnected
+            try:
+                wfile1.write("OPPONENT_DISCONNECTED. YOU WIN!\n")
+                wfile1.flush()
+            except Exception:
+                pass
+            try:
+                wfile2.write("OPPONENT_DISCONNECTED. YOU WIN!\n")
+                wfile2.flush()
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[WARN] Exception in two-player game: {e}")
+        finally:
+            conn1.close()
+            conn2.close()
+            print(f"[INFO] Two-player game between {addr1} and {addr2} ended.")
+    except Exception as e:
+        print(f"[ERROR] Error in two-player game setup: {e}")
+
+def lobby_manager():
+    while True:
+        with waiting_players_lock:
+            if len(waiting_lines) >= 2:
+                (conn1, addr1) = waiting_lines.pop(0) # extract players from the line by FIFO
+                (conn2, addr2) = waiting_lines.pop(0)
+                threading.Thread(target=two_player_game, args=(conn1, addr1, conn2, addr2), daemon=True).start()
+def game_manager(conn, addr, mode):
+    if mode == "1":
+        single_player(conn, addr)
+    else:
+        # add the new connected players to the waiting line
+        with waiting_players_lock:
+            waiting_lines.append((conn, addr))
+        try:
+            wfile = conn.makefile('w')
+            wfile.write("Waiting for another player to join...\n")
+            wfile.flush()
+        except Exception:
+            pass
 
 def main():
     mode = input ("Select mode: (1) Single player, (2) Two player: ").strip()
     print(f"[INFO] Server listening on {HOST}:{PORT}")
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((HOST, PORT))
-        if mode == "1":
-            s.listen(1)
-            conn, addr = s.accept()
-            print(f"[INFO] Client connected from {addr}")
-            with conn:
-                rfile = conn.makefile('r')
-                wfile = conn.makefile('w')
-                run_single_player_game_online(rfile, wfile)
-            print("[INFO] Client disconnected.")
-        else:
-            s.listen(2)
-            clients = []
-            while len(clients) < 2:
-                conn, addr = s.accept()
-                print(f"[INFO] Client connected from {addr}")
-                clients.append(conn)
-            rfile1 = clients[0].makefile('r')
-            wfile1 = clients[0].makefile('w')
-            rfile2 = clients[1].makefile('r')
-            wfile2 = clients[1].makefile('w')
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # keep the server up for running again
+        s.listen(10)
+        if mode == "2":
+            threading.Thread(target=lobby_manager, daemon=True).start()
+        while True:
             try:
-                run_two_player_game_online(rfile1, wfile1, rfile2, wfile2)
-            finally:
-                for c in clients:
-                    c.close()
-            print("[INFO] Two-player game ended. Connections closed.")
+                conn, addr = s.accept()
+                print(f"[INFO] Player connected from {addr}")
+                threading.Thread(target=game_manager, args=(conn, addr, mode), daemon=True).start()
+            except Exception as e:
+                print(f"[ERROR] Accept failed: {e}")
+
 # HINT: For multiple clients, you'd need to:
 # 1. Accept connections in a loop
 # 2. Handle each client in a separate thread
