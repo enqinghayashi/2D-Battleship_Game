@@ -30,7 +30,7 @@ player_sessions = {}  # username: {'conn':..., 'addr':..., 'game_state':..., 'la
 player_sessions_lock = threading.Lock()
 RECONNECT_TIMEOUT = 60  # seconds
 
-# --- T3.3: Add two-player session tracking ---
+# Add two-player session tracking
 two_player_sessions = {}  # username: {'conn':..., 'addr':..., 'rfile':..., 'wfile':..., 'board':..., 'opponent':..., 'last_disconnect':..., 'game_state':...}
 two_player_sessions_lock = threading.Lock()
 
@@ -78,12 +78,12 @@ def single_player(conn, addr):
                 run_single_player_game_online(rfile, wfile)
                 return
 
-        # Start new session ---
+        # Start new session 
         run_single_player_game_online(rfile, wfile)
     except Exception as e:
         print(f"[WARN] Single player client {addr} disconnected: {e}")
     finally:
-        # Save session for possible reconnection ---
+        # Save session for possible reconnection 
         try:
             if 'username' in locals() and username:
                 with player_sessions_lock:
@@ -154,6 +154,29 @@ def notify_spectator_board(board, label="GRID"):
                 wfile.flush()
             except Exception:
                 spectators.remove(spectator)
+
+def notify_all_waiting_players(message):
+    """Notify all clients in waiting_lines."""
+    with waiting_players_lock:
+        for conn, addr in waiting_lines:
+            try:
+                wfile = conn.makefile('w')
+                wfile.write(message + '\n')
+                wfile.flush()
+            except Exception:
+                pass  # Ignore failures
+
+def notify_next_match_players(conn1, conn2, username1, username2):
+    """Notify the two selected players for the next match."""
+    try:
+        wfile1 = conn1.makefile('w')
+        wfile2 = conn2.makefile('w')
+        wfile1.write(f"You have been selected for the next match! You will play against {username2}.\n")
+        wfile2.write(f"You have been selected for the next match! You will play against {username1}.\n")
+        wfile1.flush()
+        wfile2.flush()
+    except Exception:
+        pass
 
 def two_player_game(conn1, addr1, conn2, addr2):
     global game_running
