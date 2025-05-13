@@ -35,6 +35,29 @@ def single_player(conn, addr):
         conn.close()
         print(f"[INFO] Single player client {addr} connection closed.")
 
+def handle_spectator(conn, addr):
+    try:
+        wfile = conn.makefile('w')
+        wfile.write("You are a spectator. You can observe the current game.\n")
+        wfile.flush()
+        while True:
+            threading.Event().wait(1)
+    except Exception as e:
+        print(f"[INFO] Spectator {addr} disconnected: {e}")
+    finally:
+        conn.close()
+        print(f"[INFO] Spectator {addr} connection closed.")
+
+def notify_spectator(message):
+    with spectators_lock:
+        for spectator in spectators[:]:
+            try:
+                wfile = spectator.makefile('w')
+                wfile.write(message + '\n')
+                wfile.flush()
+            except Exception:
+                spectators.remove(spectator)
+
 def two_player_game(conn1, addr1, conn2, addr2):
     global game_running
     try:
