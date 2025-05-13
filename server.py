@@ -64,6 +64,22 @@ def notify_spectator(message):
             except Exception:
                 spectators.remove(spectator)
 
+def notify_spectator_board(board, label="GRID"):
+    with spectators_lock:
+        for spectator in spectators[:]:
+            try:
+                wfile = spectator.makefile('w')
+                wfile.write(f"{label}\n")
+                wfile.write("   " + " ".join(f"{i+1:2}" for i in range(board.size)) + '\n')
+                for r in range(board.size):
+                    row_label = chr(ord('A') + r)
+                    row_str = " ".join(board.display_grid[r][c] for c in range(board.size))
+                    wfile.write(f"{row_label:2} {row_str}\n")
+                wfile.write('\n')
+                wfile.flush()
+            except Exception:
+                spectators.remove(spectator)
+
 def two_player_game(conn1, addr1, conn2, addr2):
     global game_running
     try:
@@ -73,7 +89,7 @@ def two_player_game(conn1, addr1, conn2, addr2):
         wfile2 = conn2.makefile('w')
         game_running.set()
         notify_spectator("[INFO] A new game has started between two players.")
-        run_two_player_game_online(rfile1, wfile1, rfile2, wfile2)
+        run_two_player_game_online(rfile1, wfile1, rfile2, wfile2, spectator_msg_callback=notify_spectator, spectator_board_callback=notify_spectator_board)
     except Exception as e:
         print(f"[ERROR] Exception during game: {e}")
          # One or both players disconnected
