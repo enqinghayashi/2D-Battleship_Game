@@ -38,10 +38,16 @@ def single_player(conn, addr):
 def handle_spectator(conn, addr):
     try:
         wfile = conn.makefile('w')
+        rfile = conn.makefile('r')
         wfile.write("You are a spectator. You can observe the current game.\n")
         wfile.flush()
         while True:
-            threading.Event().wait(1)
+            line = rfile.readline()
+            if not line:
+                break
+            # Respond to any spectator input with an error
+            wfile.write("ERROR: Spectators cannot play.\n")
+            wfile.flush()
     except Exception as e:
         print(f"[INFO] Spectator {addr} disconnected: {e}")
     finally:
