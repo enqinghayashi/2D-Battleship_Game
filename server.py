@@ -95,25 +95,29 @@ def lobby_manager():
     while True:
         with waiting_players_lock:
             if len(waiting_lines) >= 2 and not game_running.is_set():
-                (conn1, addr1) = waiting_lines.pop(0) # extract players from the line by FIFO
+                (conn1, addr1) = waiting_lines.pop(0)
                 (conn2, addr2) = waiting_lines.pop(0)
                 print("[INFO] Starting new two player game.")
                 threading.Thread(target=two_player_game, args=(conn1, addr1, conn2, addr2), daemon=True).start()
-        threading.Event().wait(0.5) # Sleeps the threaded game if no players
+        threading.Event().wait(0.5)
 
 def game_manager(conn, addr, mode):
     if mode == "1":
         single_player(conn, addr)
     else:
-        # add the new connected players to the waiting line
         with waiting_players_lock:
-            waiting_lines.append((conn, addr))
-        try:
-            wfile = conn.makefile('w')
-            wfile.write("Waiting for another player to join...\n")
-            wfile.flush()
-        except Exception:
-            print(f"[WARN] Failed to notify player at {addr}: {e}")
+            if len(waiting_lines) < 2 and not game_running.is_set():
+                waiting_lines.append((conn, addr))
+                try:
+                    wfile = conn.makefile('w')
+                    wfile.write("Waiting for another player to join...\n")
+                    wfile.flush()
+                except Exception as e:
+                    print(f"[WARN] Failed to notify player at {addr}: {e}")
+            else:
+                with spectators_lock:
+                    spectators.append(conn)
+                threading.Thread(target=handle_spectator, args=(conn, addr), daemon=True).start()
 
 def main():
     mode = input ("Select mode: (1) Single player, (2) Two player: ").strip()
@@ -131,11 +135,6 @@ def main():
                 threading.Thread(target=game_manager, args=(conn, addr, mode), daemon=True).start()
             except Exception as e:
                 print(f"[ERROR] Accept failed: {e}")
-
-# HINT: For multiple clients, you'd need to:
-# 1. Accept connections in a loop
-# 2. Handle each client in a separate thread
-# 3. Import threading and create a handle_client function
 
 if __name__ == "__main__":
     main()
