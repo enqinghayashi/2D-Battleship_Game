@@ -70,11 +70,21 @@ def display_messages():
 def main():
     global running, messages
 
+    # Prompt for username/client ID for reconnection support
+    username = input("Enter your username (for reconnection support): ").strip()
+    if not username:
+        print("Username cannot be empty.")
+        return
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect((HOST, PORT))
         rfile = s.makefile('r')
         wfile = s.makefile('w')
         
+        # Send username/client ID to server immediately after connecting 
+        wfile.write(f"USERNAME {username}\n")
+        wfile.flush()
+
         print("Connected to server. Waiting for game to start...")
         initial_msg = rfile.readline().strip()
         if initial_msg:
