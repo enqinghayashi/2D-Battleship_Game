@@ -18,9 +18,12 @@ HOST = '127.0.0.1'
 PORT = 5000
 
 waiting_lines = []
-waiting_players_lock = threading.Lock() # a lock to thread for needing 2 players to start the game
+spectators = []
+waiting_players_lock = threading.Lock()
+spectators_lock = threading.Lock()
 game_lock = threading.Lock()
 game_running = threading.Event()
+
 def single_player(conn, addr):
     try:
         rfile = conn.makefile('r')
