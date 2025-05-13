@@ -254,10 +254,40 @@ def two_player_game(conn1, addr1, conn2, addr2):
 def lobby_manager():
     while True:
         with waiting_players_lock:
+            # Notify all waiting clients about their position and next match 
             if len(waiting_lines) >= 2 and not game_running.is_set():
                 (conn1, addr1) = waiting_lines.pop(0)
                 (conn2, addr2) = waiting_lines.pop(0)
-                print("[INFO] Starting new two player game.")
+                # Get usernames for notification
+                try:
+                    rfile1 = conn1.makefile('r')
+                    username1 = None
+                    # Try to peek username from the socket (without consuming it)
+                    pos = rfile1.tell() if hasattr(rfile1, 'tell') else None
+                    line = rfile1.readline()
+                    if line and line.startswith("USERNAME "):
+                        username1 = line.strip().split(" ", 1)[1]
+                    if pos is not None:
+                        rfile1.seek(pos)
+                except Exception:
+                    username1 = "Player1"
+                try:
+                    rfile2 = conn2.makefile('r')
+                    username2 = None
+                    pos = rfile2.tell() if hasattr(rfile2, 'tell') else None
+                    line = rfile2.readline()
+                    if line and line.startswith("USERNAME "):
+                        username2 = line.strip().split(" ", 1)[1]
+                    if pos is not None:
+                        rfile2.seek(pos)
+                except Exception:
+                    username2 = "Player2"
+                # Notify selected players
+                notify_next_match_players(conn1, conn2, username1 or "Player1", username2 or "Player2")
+                # Notify all other waiting clients
+                notify_all_waiting_players(f"Next match: {username1 or 'Player1'} vs {username2 or 'Player2'} is starting soon.")
+                notify_spectator(f"[INFO] Next match: {username1 or 'Player1'} vs {username2 or 'Player2'} is starting.")
+                print(f"[INFO] Starting new two player game: {username1 or 'Player1'} vs {username2 or 'Player2'}.")
                 threading.Thread(target=two_player_game, args=(conn1, addr1, conn2, addr2), daemon=True).start()
         threading.Event().wait(0.5)
 
