@@ -394,12 +394,14 @@ def run_single_player_game_online(rfile, wfile):
             send(f"ERROR {e}")
 
 
-def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
+def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2, spectator_msg_callback=None, spectator_board_callback=None):
     """
     Runs a two-player online Battleship game.
     Each player places ships, then takes turns firing at the other.
     Reports hit/miss/sunk, ends when one player has all ships sunk or forfeits.
     Uses minimal protocol messages: PLACE, FIRE, RESULT, WIN, etc.
+    If spectator_msg_callback and spectator_board_callback are provided,
+    notify updates to spectators.
     """
     def send(wfile, msg):
         try:
@@ -505,11 +507,19 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
         send_board(wfile, opponent_board)
         send(wfile, "READY")
         send(opponent_wfile, "WAITING")
+        if spectator_msg_callback:
+            spectator_msg_callback(f"[INFO] Player {player_num}'s turn.")
+        if spectator_board_callback:
+            spectator_board_callback(board1, label="PLAYER1_GRID")
+            spectator_board_callback(board2, label="PLAYER2_GRID")
         
         msg = safe_recv(rfile)
         if msg.lower() == 'quit':
             send(wfile, "BYE")
             send(opponent_wfile, "OPPONENT_QUIT")
+            if spectator_msg_callback:
+                spectator_msg_callback("[INFO] A player quit. Game ended.")
+            break
             break
         
         
@@ -533,19 +543,29 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
             
             result, sunk_name = opponent_board.fire_at(row, col)       
             moves += 1
-            send(wfile, format_result_message(result, sunk_name))
+            msg_result = format_result_message(result, sunk_name)
+            send(wfile, msg_result)
             if result == 'hit':
                 if sunk_name:
                     send(wfile, f"SUNK {sunk_name.upper()}")
                     send(opponent_wfile, f"YOUR_SHIP_SUNK {sunk_name.upper()}")
+                    if spectator_msg_callback:
+                        spectator_msg_callback(f"[UPDATE] {sunk_name.upper()} was sunk!")
                 else:
                     send(wfile, "HIT")
                     send(opponent_wfile, "YOUR_SHIP_HIT")
+                    if spectator_msg_callback:
+                        spectator_msg_callback(f"[UPDATE] It was a hit!")
                 if opponent_board.all_ships_sunk():
                     send_board(wfile, opponent_board)
                     send_board(opponent_wfile, opponent_board)
                     send(wfile, f"WIN {moves}")
                     send(opponent_wfile, "LOSE")
+                    if spectator_msg_callback:
+                        spectator_msg_callback(f"[GAME OVER] Player {player_num} wins in {moves} moves!")
+                    if spectator_board_callback:
+                        spectator_board_callback(board1, label="PLAYER1_GRID")
+                        spectator_board_callback(board2, label="PLAYER2_GRID")
                     break
             elif result == 'miss':
                 send(wfile, "MISS")
