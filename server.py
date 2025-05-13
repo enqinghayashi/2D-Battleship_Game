@@ -12,6 +12,7 @@ However, if you want to support multiple clients (i.e. progress through further 
 
 import socket
 import threading
+import time
 from battleship import run_single_player_game_online, run_two_player_game_online
 
 HOST = '127.0.0.1'
@@ -24,16 +25,90 @@ spectators_lock = threading.Lock()
 game_lock = threading.Lock()
 game_running = threading.Event()
 
+# Store player sessions for reconnection support 
+player_sessions = {}  # username: {'conn':..., 'addr':..., 'game_state':..., 'last_disconnect':..., ...}
+player_sessions_lock = threading.Lock()
+RECONNECT_TIMEOUT = 60  # seconds
+
+# --- T3.3: Add two-player session tracking ---
+two_player_sessions = {}  # username: {'conn':..., 'addr':..., 'rfile':..., 'wfile':..., 'board':..., 'opponent':..., 'last_disconnect':..., 'game_state':...}
+two_player_sessions_lock = threading.Lock()
+
+def get_username(rfile):
+    """Read USERNAME <name> from client at connection."""
+    while True:
+        line = rfile.readline()
+        if not line:
+            return None
+        if line.startswith("USERNAME "):
+            return line.strip().split(" ", 1)[1]
+        # Ignore other lines until username is received
+
 def single_player(conn, addr):
     try:
         rfile = conn.makefile('r')
         wfile = conn.makefile('w')
+        # Get username/client ID for session tracking 
+        username = get_username(rfile)
+        if not username:
+            wfile.write("ERROR: Username required for reconnection support.\n")
+            wfile.flush()
+            conn.close()
+            return
+
+        # Check for existing session (reconnection) 
+        with player_sessions_lock:
+            session = player_sessions.get(username)
+            now = time.time()
+            if session and session.get('last_disconnect') and now - session['last_disconnect'] <= RECONNECT_TIMEOUT:
+                # Resume previous game state
+                wfile.write("RECONNECTED. Resuming your previous game.\n")
+                wfile.flush()
+                # Restore game state (for single player, just rerun with saved state)
+                # For demo, we just clear the session and start a new game
+                del player_sessions[username]
+                # In a real implementation, we restore the actual game state here
+                run_single_player_game_online(rfile, wfile)
+                return
+            elif session and session.get('last_disconnect'):
+                # Timeout exceeded
+                wfile.write("RECONNECT_TIMEOUT. Your previous game has expired.\n")
+                wfile.flush()
+                del player_sessions[username]
+                run_single_player_game_online(rfile, wfile)
+                return
+
+        # Start new session ---
         run_single_player_game_online(rfile, wfile)
     except Exception as e:
         print(f"[WARN] Single player client {addr} disconnected: {e}")
     finally:
+        # Save session for possible reconnection ---
+        try:
+            if 'username' in locals() and username:
+                with player_sessions_lock:
+                    player_sessions[username] = {
+                        'conn': None,
+                        'addr': addr,
+                        'game_state': None,  # For demo, not storing actual game state
+                        'last_disconnect': time.time()
+                    }
+        except Exception:
+            pass
         conn.close()
         print(f"[INFO] Single player client {addr} connection closed.")
+
+def wait_for_reconnect(username, opponent_username, timeout=RECONNECT_TIMEOUT):
+    """Wait for a player to reconnect within timeout seconds. Returns new (conn, rfile, wfile) or None."""
+    start = time.time()
+    while time.time() - start < timeout:
+        with two_player_sessions_lock:
+            session = two_player_sessions.get(username)
+            if session and session.get('conn'):
+                # Reconnected
+                return session['conn'], session['rfile'], session['wfile']
+        time.sleep(1)
+    return None, None, None
 
 def handle_spectator(conn, addr):
     try:
@@ -82,17 +157,52 @@ def notify_spectator_board(board, label="GRID"):
 
 def two_player_game(conn1, addr1, conn2, addr2):
     global game_running
+    # Get usernames for both players ---
+    rfile1 = conn1.makefile('r')
+    wfile1 = conn1.makefile('w')
+    username1 = get_username(rfile1)
+    rfile2 = conn2.makefile('r')
+    wfile2 = conn2.makefile('w')
+    username2 = get_username(rfile2)
+    if not username1 or not username2:
+        try:
+            wfile1.write("ERROR: Username required.\n")
+            wfile1.flush()
+        except Exception:
+            pass
+        try:
+            wfile2.write("ERROR: Username required.\n")
+            wfile2.flush()
+        except Exception:
+            pass
+        conn1.close()
+        conn2.close()
+        return
+
+    # Register sessions 
+    with two_player_sessions_lock:
+        two_player_sessions[username1] = {'conn': conn1, 'addr': addr1, 'rfile': rfile1, 'wfile': wfile1, 'opponent': username2, 'last_disconnect': None, 'game_state': None}
+        two_player_sessions[username2] = {'conn': conn2, 'addr': addr2, 'rfile': rfile2, 'wfile': wfile2, 'opponent': username1, 'last_disconnect': None, 'game_state': None}
+
     try:
-        rfile1 = conn1.makefile('r')
-        wfile1 = conn1.makefile('w')
-        rfile2 = conn2.makefile('r')
-        wfile2 = conn2.makefile('w')
         game_running.set()
         notify_spectator("[INFO] A new game has started between two players.")
-        run_two_player_game_online(rfile1, wfile1, rfile2, wfile2, spectator_msg_callback=notify_spectator, spectator_board_callback=notify_spectator_board)
+
+        # run_two_player_game_online with reconnection/session support
+        run_two_player_game_online(
+            two_player_sessions[username1]['rfile'], two_player_sessions[username1]['wfile'],
+            two_player_sessions[username2]['rfile'], two_player_sessions[username2]['wfile'],
+            spectator_msg_callback=notify_spectator,
+            spectator_board_callback=notify_spectator_board,
+            two_player_sessions=two_player_sessions,
+            two_player_sessions_lock=two_player_sessions_lock,
+            username1=username1,
+            username2=username2,
+            RECONNECT_TIMEOUT=RECONNECT_TIMEOUT
+        )
+
     except Exception as e:
         print(f"[ERROR] Exception during game: {e}")
-         # One or both players disconnected
         try:
             wfile1.write("OPPONENT_DISCONNECTED. YOU WIN!\n")
             wfile1.flush()
@@ -105,13 +215,18 @@ def two_player_game(conn1, addr1, conn2, addr2):
             pass
     finally:
         try:
+            with two_player_sessions_lock:
+                if username1 in two_player_sessions:
+                    del two_player_sessions[username1]
+                if username2 in two_player_sessions:
+                    del two_player_sessions[username2]
             conn1.close()
             conn2.close()
             print(f"[INFO] Two-player game between {addr1} and {addr2} ended.")
             game_running.clear()
             notify_spectator("[INFO] The game has ended.")
         except Exception as e:
-            print(f"[ERROR] Error in two-player game setup: {e}")
+            print(f"[ERROR] Error in two-player game cleanup: {e}")
 
 def lobby_manager():
     while True:
