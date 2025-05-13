@@ -66,10 +66,11 @@ def two_player_game(conn1, addr1, conn2, addr2):
         rfile2 = conn2.makefile('r')
         wfile2 = conn2.makefile('w')
         game_running.set()
+        notify_spectator("[INFO] A new game has started between two players.")
         run_two_player_game_online(rfile1, wfile1, rfile2, wfile2)
     except Exception as e:
         print(f"[ERROR] Exception during game: {e}")
-            # One or both players disconnected
+         # One or both players disconnected
         try:
             wfile1.write("OPPONENT_DISCONNECTED. YOU WIN!\n")
             wfile1.flush()
@@ -86,6 +87,7 @@ def two_player_game(conn1, addr1, conn2, addr2):
             conn2.close()
             print(f"[INFO] Two-player game between {addr1} and {addr2} ended.")
             game_running.clear()
+            notify_spectator("[INFO] The game has ended.")
         except Exception as e:
             print(f"[ERROR] Error in two-player game setup: {e}")
 
