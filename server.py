@@ -302,6 +302,9 @@ def game_manager(conn, addr, mode):
                     wfile = conn.makefile('w')
                     wfile.write("Waiting for another player to join...\n")
                     wfile.flush()
+                    # Notify the clients about position in lines
+                    wfile.write(f"You are in position {len(waiting_lines)} in the waiting queue.\n")
+                    wfile.flush()
                 except Exception as e:
                     print(f"[WARN] Failed to notify player at {addr}: {e}")
             else:
