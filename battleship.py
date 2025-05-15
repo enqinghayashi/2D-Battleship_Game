@@ -9,6 +9,7 @@ Contains core data structures and logic for Battleship, including:
 """
 
 import random
+import time
 
 BOARD_SIZE = 10
 SHIPS = [
@@ -394,12 +395,20 @@ def run_single_player_game_online(rfile, wfile):
             send(f"ERROR {e}")
 
 
-def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
+def run_two_player_game_online(
+    rfile1, wfile1, rfile2, wfile2,
+    spectator_msg_callback=None, spectator_board_callback=None,
+    two_player_sessions=None, two_player_sessions_lock=None,
+    username1=None, username2=None, RECONNECT_TIMEOUT=60
+):
     """
     Runs a two-player online Battleship game.
     Each player places ships, then takes turns firing at the other.
     Reports hit/miss/sunk, ends when one player has all ships sunk or forfeits.
     Uses minimal protocol messages: PLACE, FIRE, RESULT, WIN, etc.
+    If spectator_msg_callback and spectator_board_callback are provided,
+    notify updates to spectators.
+    Enables reconnection support.
     """
     def send(wfile, msg):
         try:
@@ -432,14 +441,35 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
             wfile.flush()
         except Exception:
             raise ConnectionError("Opponent disconnected from the game")
-    def safe_recv(rfile):
+
+    def wait_for_reconnect(username, opponent_username, timeout=RECONNECT_TIMEOUT):
+        start = time.time()
+        while time.time() - start < timeout:
+            with two_player_sessions_lock:
+                session = two_player_sessions.get(username)
+                if session and session.get('conn'):
+                    return session['conn'], session['rfile'], session['wfile']
+            time.sleep(1)
+        return None, None, None
+
+    def safe_recv(rfile, username=None, opponent_username=None):
         try:
             line = rfile.readline()
-            if not line:
+            if not line and two_player_sessions and username and opponent_username:
+                send(two_player_sessions[opponent_username]['wfile'], f"WAITING_FOR_RECONNECT {username}")
+                conn, new_rfile, new_wfile = wait_for_reconnect(username, opponent_username)
+                if not conn:
+                    send(two_player_sessions[opponent_username]['wfile'], f"RECONNECT_TIMEOUT {username}")
+                    return None
+                with two_player_sessions_lock:
+                    two_player_sessions[username]['rfile'] = new_rfile
+                    two_player_sessions[username]['wfile'] = new_wfile
+                return safe_recv(new_rfile, username, opponent_username)
+            elif not line:
                 raise ConnectionError("Opponent disconnected from the game")
             return line.strip()
         except Exception:
-            raise ConnectionError("Opponent disconnected from the game")
+            return None
 
     board1 = Board(BOARD_SIZE)
     board2 = Board(BOARD_SIZE)
@@ -457,7 +487,14 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
                 send(wfile, f"PLACE {ship_name}(shipName) {ship_size}(shipSize) ")
                 send(wfile, f"Respond something like PLACE <COORD> <ORIENTATION> <SHIPNAME> ")
                 send(wfile, f"e.g. 'place b6 v battleship' v:vertical, h: horizontal ")
-                msg = safe_recv(rfile)
+                if two_player_sessions and two_player_sessions_lock and username1 and username2:
+                    username = username1 if player_num == 1 else username2
+                    opponent_username = username2 if player_num == 1 else username1
+                    msg = safe_recv(rfile, username, opponent_username)
+                else:
+                    msg = safe_recv(rfile)
+                if msg is None:
+                    return
                 try:
                     coord_str, orientation_str, name = parse_place_message(msg)
                     if name != ship_name.upper():
@@ -494,34 +531,43 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
             opponent_board = board2
             player_num = 1
             player_board = board1
+            username = username1 if two_player_sessions else None
+            opponent_username = username2 if two_player_sessions else None
         else:
             rfile, wfile = rfile2, wfile2
             opponent_wfile = wfile1
             opponent_board = board1
             player_num = 2
             player_board = board2
-            
+            username = username2 if two_player_sessions else None
+            opponent_username = username1 if two_player_sessions else None
+
         send_my_board(wfile, player_board)
         send_board(wfile, opponent_board)
         send(wfile, "READY")
         send(opponent_wfile, "WAITING")
-        
-        msg = safe_recv(rfile)
+        if spectator_msg_callback:
+            spectator_msg_callback(f"[INFO] Player {player_num}'s turn.")
+        if spectator_board_callback:
+            spectator_board_callback(board1, label="PLAYER1_GRID")
+            spectator_board_callback(board2, label="PLAYER2_GRID")
+
+        if two_player_sessions and two_player_sessions_lock and username and opponent_username:
+            msg = safe_recv(rfile, username, opponent_username)
+        else:
+            msg = safe_recv(rfile)
+        if msg is None:
+            send(opponent_wfile, "OPPONENT_DISCONNECTED. YOU WIN!\n")
+            return
         if msg.lower() == 'quit':
             send(wfile, "BYE")
             send(opponent_wfile, "OPPONENT_QUIT")
+            if spectator_msg_callback:
+                spectator_msg_callback("[INFO] A player quit. Game ended.")
             break
-        
-        
-        
-        try:
-            try:
-                coord = parse_fire_message(msg)
-            except ValueError:
-                send(wfile, "ERROR Invalid FIRE command format. Use 'FIRE A5'")
-                continue
 
-            # validate the coordinates
+        try:
+            coord = parse_fire_message(msg)
             if len(coord) < 2 or not coord[0].isalpha() or not coord[1:].isdigit():
                 send(wfile, f"ERROR Invalid coordinate format: {coord}")
                 continue
@@ -533,19 +579,29 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
             
             result, sunk_name = opponent_board.fire_at(row, col)       
             moves += 1
-            send(wfile, format_result_message(result, sunk_name))
+            msg_result = format_result_message(result, sunk_name)
+            send(wfile, msg_result)
             if result == 'hit':
                 if sunk_name:
                     send(wfile, f"SUNK {sunk_name.upper()}")
                     send(opponent_wfile, f"YOUR_SHIP_SUNK {sunk_name.upper()}")
+                    if spectator_msg_callback:
+                        spectator_msg_callback(f"[UPDATE] {sunk_name.upper()} was sunk!")
                 else:
                     send(wfile, "HIT")
                     send(opponent_wfile, "YOUR_SHIP_HIT")
+                    if spectator_msg_callback:
+                        spectator_msg_callback(f"[UPDATE] It was a hit!")
                 if opponent_board.all_ships_sunk():
                     send_board(wfile, opponent_board)
                     send_board(opponent_wfile, opponent_board)
                     send(wfile, f"WIN {moves}")
                     send(opponent_wfile, "LOSE")
+                    if spectator_msg_callback:
+                        spectator_msg_callback(f"[GAME OVER] Player {player_num} wins in {moves} moves!")
+                    if spectator_board_callback:
+                        spectator_board_callback(board1, label="PLAYER1_GRID")
+                        spectator_board_callback(board2, label="PLAYER2_GRID")
                     break
             elif result == 'miss':
                 send(wfile, "MISS")
