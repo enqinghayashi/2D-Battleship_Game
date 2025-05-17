@@ -12,6 +12,7 @@ However, if you want to support multiple clients (i.e. progress through further 
 
 import socket
 import threading
+import time
 from battleship import run_single_player_game_online, run_two_player_game_online
 
 HOST = '127.0.0.1'
@@ -43,7 +44,7 @@ def two_player_game(conn1, addr1, conn2, addr2):
         run_two_player_game_online(rfile1, wfile1, rfile2, wfile2)
     except Exception as e:
         print(f"[ERROR] Exception during game: {e}")
-            # One or both players disconnected
+        # One or both players disconnected
         try:
             wfile1.write("OPPONENT_DISCONNECTED. YOU WIN!\n")
             wfile1.flush()
@@ -54,11 +55,12 @@ def two_player_game(conn1, addr1, conn2, addr2):
             wfile2.flush()
         except Exception:
             pass
+        print(f"[INFO] Notified remaining player(s) of win and returning to lobby.")
     finally:
         try:
             conn1.close()
             conn2.close()
-            print(f"[INFO] Two-player game between {addr1} and {addr2} ended.")
+            print(f"[INFO] Two-player game between {addr1} and {addr2} ended. Players returned to lobby if still connected.")
             game_running.clear()
         except Exception as e:
             print(f"[ERROR] Error in two-player game setup: {e}")
@@ -77,15 +79,36 @@ def game_manager(conn, addr, mode):
     if mode == "1":
         single_player(conn, addr)
     else:
-        # add the new connected players to the waiting line
+        # If a game is already running, notify the player they are in the lobby
         with waiting_players_lock:
             waiting_lines.append((conn, addr))
+            if game_running.is_set():
+                try:
+                    wfile = conn.makefile('w')
+                    wfile.write("A game is currently in progress. You are in the lobby and will join the next game when it starts.\n")
+                    wfile.flush()
+                except Exception:
+                    print(f"[WARN] Failed to notify player at {addr}: {e}")
+            else:
+                try:
+                    wfile = conn.makefile('w')
+                    wfile.write("Waiting for another player to join...\n")
+                    wfile.flush()
+                except Exception:
+                    print(f"[WARN] Failed to notify player at {addr}: {e}")
+        # Wait for the connection to close (i.e., after a game or disconnect)
         try:
-            wfile = conn.makefile('w')
-            wfile.write("Waiting for another player to join...\n")
-            wfile.flush()
+            while True:
+                if conn.fileno() == -1:
+                    print(f"[INFO] Player at {addr} returned to lobby and is waiting for a new game.")
+                    break
+                with waiting_players_lock:
+                    if (conn, addr) not in waiting_lines and conn.fileno() != -1:
+                        print(f"[INFO] Player at {addr} returned to lobby and is waiting for a new game.")
+                        break
+                time.sleep(0.5)
         except Exception:
-            print(f"[WARN] Failed to notify player at {addr}: {e}")
+            print(f"[INFO] Player at {addr} returned to lobby and is waiting for a new game.")
 
 def main():
     mode = input ("Select mode: (1) Single player, (2) Two player: ").strip()
