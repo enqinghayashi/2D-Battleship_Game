@@ -61,6 +61,7 @@ def two_player_game(conn1, addr1, conn2, addr2):
     global game_running
     winner_conn = None
     winner_addr = None
+    last_winner_addr = None
     try:
         rfile1 = conn1.makefile('r')
         wfile1 = conn1.makefile('w')
@@ -107,6 +108,51 @@ def two_player_game(conn1, addr1, conn2, addr2):
                 lobby_broadcast=lobby_broadcast
             )
             print(f"[DEBUG] Finished two player game for {addr1} and {addr2}")
+            # --- After game ends, notify lobby who will play next ---
+            with waiting_players_lock:
+                # Remove any closed/disconnected connections from waiting_lines
+                waiting_lines[:] = [(c, a) for (c, a) in waiting_lines if c.fileno() != -1]
+                # Find the winner if still connected
+                winner_in_lobby = None
+                if len(waiting_lines) > 0:
+                    # If the winner is still in the lobby, they are at the front
+                    winner_in_lobby = waiting_lines[0]
+                # Compose message for lobby
+                if winner_in_lobby:
+                    # Winner is still in the lobby, so next match is winner vs next in queue
+                    if len(waiting_lines) > 1:
+                        next_opponent = waiting_lines[1]
+                        msg = (
+                            f"[LOBBY] Next match: {winner_in_lobby[1]} (last game winner) "
+                            f"vs {next_opponent[1]}. The match will begin in FIVE SECONDS."
+                        )
+                    else:
+                        msg = (
+                            f"[LOBBY] Next match: {winner_in_lobby[1]} (last game winner) "
+                            f"awaiting an opponent. The match will begin when another player joins."
+                        )
+                else:
+                    # Winner quit, so next two in queue play
+                    if len(waiting_lines) >= 2:
+                        msg = (
+                            f"[LOBBY] Next match: {waiting_lines[0][1]} vs {waiting_lines[1][1]}. "
+                            "The match will begin in FIVE SECONDS."
+                        )
+                    elif len(waiting_lines) == 1:
+                        msg = (
+                            f"[LOBBY] Next match: {waiting_lines[0][1]} awaiting an opponent. "
+                            "The match will begin when another player joins."
+                        )
+                    else:
+                        msg = "[LOBBY] Waiting for players to join for the next match."
+                # Broadcast to all lobby clients
+                for conn, addr in waiting_lines:
+                    try:
+                        lobby_wfile = conn.makefile('w')
+                        lobby_wfile.write(msg + "\n")
+                        lobby_wfile.flush()
+                    except Exception:
+                        pass
         except Exception as e:
             print(f"[ERROR] Exception during game logic: {e}")
     except Exception as e:
@@ -206,7 +252,47 @@ def lobby_manager():
     while True:
         with waiting_players_lock:
             if len(waiting_lines) >= 2 and not game_running.is_set():
-                (conn1, addr1) = waiting_lines.pop(0) # extract players from the line by FIFO
+                # Remove any closed/disconnected connections from waiting_lines
+                waiting_lines[:] = [(c, a) for (c, a) in waiting_lines if c.fileno() != -1]
+                winner_in_lobby = None
+                if len(waiting_lines) > 0:
+                    winner_in_lobby = waiting_lines[0]
+                if winner_in_lobby:
+                    if len(waiting_lines) > 1:
+                        next_opponent = waiting_lines[1]
+                        msg = (
+                            f"[LOBBY] Next match: {winner_in_lobby[1]} (last game winner) "
+                            f"vs {next_opponent[1]}. The match will begin in FIVE SECONDS."
+                        )
+                    else:
+                        msg = (
+                            f"[LOBBY] Next match: {winner_in_lobby[1]} (last game winner) "
+                            f"awaiting an opponent. The match will begin when another player joins."
+                        )
+                else:
+                    if len(waiting_lines) >= 2:
+                        msg = (
+                            f"[LOBBY] Next match: {waiting_lines[0][1]} vs {waiting_lines[1][1]}. "
+                            "The match will begin in FIVE SECONDS."
+                        )
+                    elif len(waiting_lines) == 1:
+                        msg = (
+                            f"[LOBBY] Next match: {waiting_lines[0][1]} awaiting an opponent. "
+                            "The match will begin when another player joins."
+                        )
+                    else:
+                        msg = "[LOBBY] Waiting for players to join for the next match."
+                # Broadcast to all lobby clients, including their queue position
+                for idx, (conn, addr) in enumerate(waiting_lines):
+                    try:
+                        lobby_wfile = conn.makefile('w')
+                        pos_msg = f"{msg}\n[LOBBY] You are position {idx+1} in the queue."
+                        lobby_wfile.write(pos_msg + "\n")
+                        lobby_wfile.flush()
+                    except Exception:
+                        pass
+                time.sleep(5.0)
+                (conn1, addr1) = waiting_lines.pop(0)
                 (conn2, addr2) = waiting_lines.pop(0)
                 print("[INFO] Starting new two player game.")
                 threading.Thread(target=two_player_game, args=(conn1, addr1, conn2, addr2), daemon=True).start()
