@@ -397,7 +397,7 @@ def run_single_player_game_online(rfile, wfile):
             send(f"ERROR {e}")
 
 
-def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
+def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2, lobby_broadcast=None):
     """
     Runs a two-player online Battleship game.
     Each player places ships, then takes turns firing at the other.
@@ -444,6 +444,13 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
         except Exception:
             raise ConnectionError("Opponent disconnected from the game")
 
+    def broadcast_lobby(msg):
+        if lobby_broadcast:
+            try:
+                lobby_broadcast(msg)
+            except Exception:
+                pass
+
     board1 = Board(BOARD_SIZE)
     board2 = Board(BOARD_SIZE)
 
@@ -459,26 +466,15 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
     def place_ships_for_player(board, rfile, wfile, player_num, opponent_wfile):
         for ship_name, ship_size in SHIPS:
             while True:
-                # (no send of WELCOME/PLACE_SHIPS here!)
                 wfile.write(f"\nPlacing your {ship_name} (size {ship_size}).\n")
                 wfile.flush()
+                # Only broadcast once per ship, not every prompt
+                break_broadcast = False
+                if ship_size == SHIPS[0][1]:  # Only for the first ship
+                    broadcast_lobby(f"[LOBBY] Player {player_num} is placing ships.")
+                # ...existing code for receiving and validating placement...
                 try:
-                    coord_str = safe_recv(rfile)
-                except ConnectionError:
-                    # Always notify opponent of win if this player disconnects
-                    try:
-                        send(opponent_wfile, "OPPONENT_DISCONNECTED. YOU WIN!")
-                        opponent_wfile.flush()
-                    except Exception:
-                        pass
-                    disconnect_flag["disconnected"] = True
-                    disconnect_flag["who"] = player_num
-                    disconnect_event.set()
-                    # Wait a moment to ensure message is sent before thread exits
-                    time.sleep(0.1)
-                    return
-                try:
-                    orientation_str = safe_recv(rfile)
+                    line = safe_recv(rfile)
                 except ConnectionError:
                     try:
                         send(opponent_wfile, "OPPONENT_DISCONNECTED. YOU WIN!")
@@ -490,24 +486,35 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
                     disconnect_event.set()
                     time.sleep(0.1)
                     return
+                # ...existing code for parsing and validating the placement...
+                try:
+                    cmd, coord_str, orientation_str, ship_str = line.strip().split()
+                    if cmd.lower() != "place":
+                        wfile.write("ERROR Invalid command. Use: place <coord> <orientation> <ship_name>\n")
+                        wfile.flush()
+                        continue
+                    if ship_str.lower() != ship_name.lower():
+                        wfile.write(f"ERROR Expected ship: {ship_name}. You typed: {ship_str}\n")
+                        wfile.flush()
+                        continue
+                except Exception:
+                    wfile.write("ERROR Invalid format. Use: place <coord> <orientation> <ship_name>\n")
+                    wfile.flush()
+                    continue
                 try:
                     row, col = parse_coordinate(coord_str)
                 except ValueError as e:
                     wfile.write(f"ERROR Invalid coordinate: {e}\n")
                     wfile.flush()
                     continue
-
-                # Convert orientation_str to 0 (horizontal) or 1 (vertical)
-                if orientation_str.upper() == 'H':
+                if orientation_str.lower() == 'h':
                     orientation = 0
-                elif orientation_str.upper() == 'V':
+                elif orientation_str.lower() == 'v':
                     orientation = 1
                 else:
-                    wfile.write("ERROR Invalid orientation. Please enter 'H' or 'V'.\n")
+                    wfile.write("ERROR Invalid orientation. Use 'h' or 'v'.\n")
                     wfile.flush()
                     continue
-
-                # Check if we can place the ship
                 if board.can_place_ship(row, col, ship_size, orientation):
                     occupied_positions = board.do_place_ship(row, col, ship_size, orientation)
                     board.placed_ships.append({
@@ -519,7 +526,6 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
                     wfile.write(f"ERROR Cannot place {ship_name} at {coord_str} (orientation={orientation_str}). Try again.\n")
                     wfile.flush()
 
-    # ...existing code for threading...
     t1 = threading.Thread(target=place_ships_for_player, args=(board1, rfile1, wfile1, 1, wfile2))
     t2 = threading.Thread(target=place_ships_for_player, args=(board2, rfile2, wfile2, 2, wfile1))
     t1.start()
@@ -569,6 +575,7 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
         send_board(wfile, opponent_board)
         send(wfile, "READY")
         send(opponent_wfile, "WAITING")
+        broadcast_lobby(f"[LOBBY] Player {player_num}'s turn. Waiting for move...")
 
         # Wait for input with timeout
         send(wfile, "You have 30 seconds to make your move.")
@@ -576,6 +583,7 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
         if not ready:
             send(wfile, "TIMEOUT. You forfeited the game.")
             send(opponent_wfile, "OPPONENT_TIMEOUT. You win!")
+            broadcast_lobby(f"[LOBBY] Player {player_num} timed out. Opponent wins!")
             # --- Force disconnect the timed-out player ---
             try:
                 # Close the timed-out player's file/socket to simulate disconnect
@@ -609,28 +617,16 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
         if msg.lower() == 'quit':
             send(wfile, "BYE")
             send(opponent_wfile, "OPPONENT_QUIT")
+            broadcast_lobby(f"[LOBBY] Player {player_num} quit. Opponent wins!")
             break
 
         try:
-            try:
-                coord = parse_fire_message(msg)
-            except ValueError:
-                send(wfile, "ERROR Invalid FIRE command format. Use 'FIRE A5'")
-                continue
-
-            # validate the coordinates
-            if len(coord) < 2 or not coord[0].isalpha() or not coord[1:].isdigit():
-                send(wfile, f"ERROR Invalid coordinate format: {coord}")
-                continue
-
+            coord = parse_fire_message(msg)
             row, col = parse_coordinate(coord)
-            if not (0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE):
-                send(wfile, f"ERROR Coordinate out of range: {coord}")
-                continue
-
             result, sunk_name = opponent_board.fire_at(row, col)
             moves += 1
             send(wfile, format_result_message(result, sunk_name))
+            broadcast_lobby(f"[LOBBY] Player {player_num} fired at {coord}: {result.upper()}{' SUNK ' + sunk_name.upper() if sunk_name else ''}")
             if result == 'hit':
                 if sunk_name:
                     send(wfile, f"SUNK {sunk_name.upper()}")
@@ -643,6 +639,7 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
                     send_board(opponent_wfile, opponent_board)
                     send(wfile, f"WIN {moves}")
                     send(opponent_wfile, "LOSE")
+                    broadcast_lobby(f"[LOBBY] Player {player_num} wins the game!")
                     break
             elif result == 'miss':
                 send(wfile, "MISS")
@@ -655,8 +652,4 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
         except Exception as e:
             send(wfile, f"ERROR {e}")
             continue
-
-
-if __name__ == "__main__":
-    # Optional: run this file as a script to test single-player mode
-    run_single_player_game_locally()
+    # ...existing code...

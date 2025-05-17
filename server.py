@@ -26,7 +26,31 @@ def single_player(conn, addr):
     try:
         rfile = conn.makefile('r')
         wfile = conn.makefile('w')
-        run_single_player_game_online(rfile, wfile)
+        print(f"[DEBUG] Starting single player game for {addr}")
+        # Add instruction for ship placement
+        instruction = (
+            "INSTRUCTION: To place a ship, type: place <start_coord> <orientation> <ship_name>\n"
+            "Example: place b6 v carrier\n"
+        )
+        wfile.write(instruction)
+        wfile.flush()
+        # Wrap the wfile to inject instruction on error
+        class WFileWrapper:
+            def __init__(self, wfile):
+                self.wfile = wfile
+            def write(self, msg):
+                if msg.startswith("ERROR Invalid coordinate:"):
+                    self.wfile.write(msg)
+                    self.wfile.write(
+                        "INSTRUCTION: To place a ship, type: place <start_coord> <orientation> <ship_name>\n"
+                        "Example: place b6 v carrier\n"
+                    )
+                else:
+                    self.wfile.write(msg)
+            def flush(self):
+                self.wfile.flush()
+        run_single_player_game_online(rfile, WFileWrapper(wfile))
+        print(f"[DEBUG] Finished single player game for {addr}")
     except Exception as e:
         print(f"[WARN] Single player client {addr} disconnected: {e}")
     finally:
@@ -42,9 +66,47 @@ def two_player_game(conn1, addr1, conn2, addr2):
         wfile1 = conn1.makefile('w')
         rfile2 = conn2.makefile('r')
         wfile2 = conn2.makefile('w')
+        print(f"[DEBUG] Starting two player game for {addr1} and {addr2}")
+        instruction = (
+            "INSTRUCTION: To place a ship, type: place <start_coord> <orientation> <ship_name>\n"
+            "Example: place b6 v carrier\n"
+        )
+        wfile1.write(instruction)
+        wfile1.flush()
+        wfile2.write(instruction)
+        wfile2.flush()
+        # Wrap the wfiles to inject instruction on error
+        class WFileWrapper:
+            def __init__(self, wfile):
+                self.wfile = wfile
+            def write(self, msg):
+                if msg.startswith("ERROR Invalid coordinate:"):
+                    self.wfile.write(msg)
+                    self.wfile.write(
+                        "INSTRUCTION: To place a ship, type: place <start_coord> <orientation> <ship_name>\n"
+                        "Example: place b6 v carrier\n"
+                    )
+                else:
+                    self.wfile.write(msg)
+            def flush(self):
+                self.wfile.flush()
+        def lobby_broadcast(msg):
+            with waiting_players_lock:
+                for conn, addr in waiting_lines:
+                    try:
+                        lobby_wfile = conn.makefile('w')
+                        lobby_wfile.write(msg + "\n")
+                        lobby_wfile.flush()
+                    except Exception:
+                        pass
         game_running.set()
         try:
-            run_two_player_game_online(rfile1, wfile1, rfile2, wfile2)
+            run_two_player_game_online(
+                rfile1, WFileWrapper(wfile1),
+                rfile2, WFileWrapper(wfile2),
+                lobby_broadcast=lobby_broadcast
+            )
+            print(f"[DEBUG] Finished two player game for {addr1} and {addr2}")
         except Exception as e:
             print(f"[ERROR] Exception during game logic: {e}")
     except Exception as e:
