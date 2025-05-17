@@ -397,7 +397,11 @@ def run_single_player_game_online(rfile, wfile):
             send(f"ERROR {e}")
 
 
-def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2, lobby_broadcast=None):
+def run_two_player_game_online(
+    rfile1, wfile1, rfile2, wfile2, lobby_broadcast=None, usernames=None,
+    board1=None, board2=None, turn=0, placed1=False, placed2=False, save_state_hook=None,
+    player_disconnected_callback=None
+):
     """
     Runs a two-player online Battleship game.
     Each player places ships, then takes turns firing at the other.
@@ -451,8 +455,11 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2, lobby_broadcast=N
             except Exception:
                 pass
 
-    board1 = Board(BOARD_SIZE)
-    board2 = Board(BOARD_SIZE)
+    # Use provided boards or create new
+    if board1 is None:
+        board1 = Board(BOARD_SIZE)
+    if board2 is None:
+        board2 = Board(BOARD_SIZE)
 
     # Only send WELCOME/PLACE_SHIPS once per player
     send(wfile1, "WELCOME PLAYER 1")
@@ -463,8 +470,22 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2, lobby_broadcast=N
     disconnect_flag = {"disconnected": False, "who": None}
     disconnect_event = threading.Event()
 
-    def place_ships_for_player(board, rfile, wfile, player_num, opponent_wfile):
-        for ship_name, ship_size in SHIPS:
+    def disconnect_and_pause(player_num):
+        if player_disconnected_callback and usernames:
+            player_disconnected_callback(usernames[player_num-1])
+        disconnect_flag["disconnected"] = True
+        disconnect_flag["who"] = player_num
+        disconnect_event.set()
+        time.sleep(0.1)
+
+    # Ship placement, skip if already placed
+    def place_ships_for_player(board, rfile, wfile, player_num, opponent_wfile, already_placed):
+        if already_placed:
+            return True
+        for ship_idx, (ship_name, ship_size) in enumerate(SHIPS):
+            # Skip already placed ships (for reconnect)
+            if len(board.placed_ships) > ship_idx:
+                continue
             while True:
                 wfile.write(f"\nPlacing your {ship_name} (size {ship_size}).\n")
                 wfile.flush()
@@ -476,16 +497,8 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2, lobby_broadcast=N
                 try:
                     line = safe_recv(rfile)
                 except ConnectionError:
-                    try:
-                        send(opponent_wfile, "OPPONENT_DISCONNECTED. YOU WIN!")
-                        opponent_wfile.flush()
-                    except Exception:
-                        pass
-                    disconnect_flag["disconnected"] = True
-                    disconnect_flag["who"] = player_num
-                    disconnect_event.set()
-                    time.sleep(0.1)
-                    return
+                    disconnect_and_pause(player_num)
+                    return False
                 # ...existing code for parsing and validating the placement...
                 try:
                     cmd, coord_str, orientation_str, ship_str = line.strip().split()
@@ -521,35 +534,45 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2, lobby_broadcast=N
                         'name': ship_name,
                         'positions': occupied_positions
                     })
+                    # Save state after each ship placement
+                    if save_state_hook:
+                        save_state_hook(
+                            board1, board2, turn,
+                            placed1 or (player_num == 1 and ship_idx == len(SHIPS)-1),
+                            placed2 or (player_num == 2 and ship_idx == len(SHIPS)-1)
+                        )
                     break
                 else:
                     wfile.write(f"ERROR Cannot place {ship_name} at {coord_str} (orientation={orientation_str}). Try again.\n")
                     wfile.flush()
+        return True
 
-    t1 = threading.Thread(target=place_ships_for_player, args=(board1, rfile1, wfile1, 1, wfile2))
-    t2 = threading.Thread(target=place_ships_for_player, args=(board2, rfile2, wfile2, 2, wfile1))
+    # Place ships (skip if already placed)
+    t1 = threading.Thread(target=place_ships_for_player, args=(board1, rfile1, wfile1, 1, wfile2, placed1))
+    t2 = threading.Thread(target=place_ships_for_player, args=(board2, rfile2, wfile2, 2, wfile1, placed2))
     t1.start()
     t2.start()
-    while t1.is_alive() or t2.is_alive():
-        if disconnect_event.is_set():
-            break
-        time.sleep(0.05)
-    t1.join(timeout=0.1)
-    t2.join(timeout=0.1)
+    t1.join()
+    t2.join()
 
-    if disconnect_flag["disconnected"]:
+    # Only mark placement as done if all ships are placed
+    placed1 = len(board1.placed_ships) == len(SHIPS)
+    placed2 = len(board2.placed_ships) == len(SHIPS)
+    if save_state_hook:
+        save_state_hook(board1, board2, turn, placed1, placed2)
+
+    if not (placed1 and placed2):
+        # If either player disconnected during placement, pause for reconnect
         return
 
-    # Only send ALL_SHIPS_PLACED once per player
     send(wfile1, "ALL_SHIPS_PLACED")
     send(wfile2, "ALL_SHIPS_PLACED")
 
     moves = 0
-    turn = 0  # 0 for Player 1's turn, 1 for Player 2's
+    # Use restored turn
+    # turn = 0  # already set from argument
 
-    # Track last valid move time for each player
     last_move_time = [time.time(), time.time()]
-    # Get the underlying sockets for select
     sock1 = rfile1._sock if hasattr(rfile1, "_sock") else rfile1.buffer.raw._sock
     sock2 = rfile2._sock if hasattr(rfile2, "_sock") else rfile2.buffer.raw._sock
 
@@ -577,16 +600,13 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2, lobby_broadcast=N
         send(opponent_wfile, "WAITING")
         broadcast_lobby(f"[LOBBY] Player {player_num}'s turn. Waiting for move...")
 
-        # Wait for input with timeout
         send(wfile, "You have 30 seconds to make your move.")
         ready, _, _ = select.select([sock], [], [], 30)
         if not ready:
             send(wfile, "TIMEOUT. You forfeited the game.")
             send(opponent_wfile, "OPPONENT_TIMEOUT. You win!")
             broadcast_lobby(f"[LOBBY] Player {player_num} timed out. Opponent wins!")
-            # --- Force disconnect the timed-out player ---
             try:
-                # Close the timed-out player's file/socket to simulate disconnect
                 if turn == 0:
                     rfile1.close()
                     wfile1.close()
@@ -602,16 +622,13 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2, lobby_broadcast=N
         try:
             msg = rfile.readline()
             if not msg:
-                send(wfile, "DISCONNECTED. You forfeited the game.")
-                send(opponent_wfile, "OPPONENT_DISCONNECTED. You win!")
+                disconnect_and_pause(player_num)
                 break
             msg = msg.strip()
         except Exception:
-            send(wfile, "DISCONNECTED. You forfeited the game.")
-            send(opponent_wfile, "OPPONENT_DISCONNECTED. You win!")
+            disconnect_and_pause(player_num)
             break
 
-        # Timeout succeeded, update last move time
         last_move_time[last_idx] = time.time()
 
         if msg.lower() == 'quit':
@@ -649,6 +666,9 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2, lobby_broadcast=N
                 continue
             # Switch turns for players
             turn = 1 - turn
+            # Save state after every move
+            if save_state_hook:
+                save_state_hook(board1, board2, turn, placed1, placed2)
         except Exception as e:
             send(wfile, f"ERROR {e}")
             continue

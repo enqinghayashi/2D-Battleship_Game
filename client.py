@@ -78,12 +78,21 @@ def display_messages():
 def main():
     global running, messages
 
+    username = input("Enter your username: ").strip()
+    if not username:
+        print("Username cannot be empty.")
+        return
+
     while True:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((HOST, PORT))
             rfile = s.makefile('r')
             wfile = s.makefile('w')
-            
+
+            # Send username for identification
+            wfile.write(f"USERNAME {username}\n")
+            wfile.flush()
+
             print("Connected to server. Waiting for game to start...")
             initial_msg = rfile.readline().strip()
             if initial_msg:
