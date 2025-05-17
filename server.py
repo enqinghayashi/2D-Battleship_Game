@@ -13,7 +13,8 @@ However, if you want to support multiple clients (i.e. progress through further 
 import socket
 import threading
 import time
-from battleship import run_single_player_game_online, run_two_player_game_online
+import queue
+from battleship import run_single_player_game_online, run_two_player_game_online, Board, BOARD_SIZE, SHIPS
 
 HOST = '127.0.0.1'
 PORT = 5000
@@ -22,7 +23,64 @@ waiting_lines = []
 waiting_players_lock = threading.Lock() # a lock to thread for needing 2 players to start the game
 game_lock = threading.Lock()
 game_running = threading.Event()
-def single_player(conn, addr):
+
+# Add player_sessions to track username -> session info
+player_sessions = {}  # username: { 'conn': ..., 'addr': ..., 'game': ..., 'last_active': ..., 'reconnect_token': ..., ... }
+player_sessions_lock = threading.Lock()
+
+RECONNECT_TIMEOUT = 60  # seconds
+
+# --- NEW: Persistent game state storage ---
+games = {}  # (username1, username2): { 'board1': ..., 'board2': ..., 'turn': ..., 'ships1': ..., 'ships2': ..., 'placed1': ..., 'placed2': ... }
+
+def handle_initial_connection(conn, addr):
+    """
+    Handles the initial handshake to get the username.
+    Returns (username, conn, addr) or (None, None, None) on failure.
+    """
+    try:
+        rfile = conn.makefile('r')
+        wfile = conn.makefile('w')
+        line = rfile.readline()
+        if not line:
+            conn.close()
+            return None, None, None
+        if not line.startswith("USERNAME "):
+            wfile.write("ERROR: Must provide USERNAME <name> as first message.\n")
+            wfile.flush()
+            conn.close()
+            return None, None, None
+        username = line.strip().split(" ", 1)[1]
+        if not username:
+            wfile.write("ERROR: Username cannot be empty.\n")
+            wfile.flush()
+            conn.close()
+            return None, None, None
+        return username, conn, addr
+    except Exception:
+        try: conn.close()
+        except: pass
+        return None, None, None
+
+def wait_for_reconnect(username, old_session, mode):
+    """
+    Waits up to RECONNECT_TIMEOUT seconds for the player to reconnect.
+    Returns new (conn, addr) if reconnected, else None.
+    """
+    start_time = time.time()
+    while time.time() - start_time < RECONNECT_TIMEOUT:
+        with player_sessions_lock:
+            session = player_sessions.get(username)
+            if session and session.get('reconnected'):
+                # Got a new connection
+                conn = session['conn']
+                addr = session['addr']
+                session['reconnected'] = False  # Reset for future disconnects
+                return conn, addr
+        time.sleep(0.5)
+    return None, None
+
+def single_player(conn, addr, username):
     try:
         rfile = conn.makefile('r')
         wfile = conn.makefile('w')
@@ -52,17 +110,65 @@ def single_player(conn, addr):
         run_single_player_game_online(rfile, WFileWrapper(wfile))
         print(f"[DEBUG] Finished single player game for {addr}")
     except Exception as e:
-        print(f"[WARN] Single player client {addr} disconnected: {e}")
+        print(f"[WARN] Single player client {addr} ({username}) disconnected: {e}")
+        # Wait for reconnection
+        with player_sessions_lock:
+            player_sessions[username]['disconnected'] = True
+        print(f"[INFO] Waiting {RECONNECT_TIMEOUT}s for {username} to reconnect...")
+        new_conn, new_addr = wait_for_reconnect(username, player_sessions[username], mode="1")
+        if new_conn:
+            print(f"[INFO] {username} reconnected from {new_addr}. Resuming game.")
+            # TODO: Restore game state if needed (for single player, may need to persist board)
+            # For now, just restart a new game
+            single_player(new_conn, new_addr, username)
+        else:
+            print(f"[INFO] {username} did not reconnect in time. Forfeiting game.")
     finally:
         conn.close()
-        print(f"[INFO] Single player client {addr} connection closed.")
+        print(f"[INFO] Single player client {addr} ({username}) connection closed.")
 
-def two_player_game(conn1, addr1, conn2, addr2):
+def two_player_game(conn1, addr1, conn2, addr2, username1, username2):
     global game_running
     winner_conn = None
     winner_addr = None
     last_winner_addr = None
+    game_key = tuple(sorted([username1, username2]))
     try:
+        # --- NEW: Mark both players as connected in game state ---
+        game_state = games.get(game_key)
+        if not game_state:
+            board1 = Board(BOARD_SIZE)
+            board2 = Board(BOARD_SIZE)
+            turn = 0
+            placed1 = False
+            placed2 = False
+            games[game_key] = {
+                'board1': board1,
+                'board2': board2,
+                'turn': turn,
+                'placed1': placed1,
+                'placed2': placed2,
+                'connected': {username1: True, username2: True},
+                'conns': {username1: conn1, username2: conn2},
+                'addrs': {username1: addr1, username2: addr2},
+                'waiting_reconnect': False,
+                'last_disconnect_time': None
+            }
+        else:
+            board1 = game_state['board1']
+            board2 = game_state['board2']
+            turn = game_state['turn']
+            placed1 = game_state.get('placed1', False)
+            placed2 = game_state.get('placed2', False)
+            game_state['connected'][username1] = True
+            game_state['connected'][username2] = True
+            game_state['conns'][username1] = conn1
+            game_state['conns'][username2] = conn2
+            game_state['addrs'][username1] = addr1
+            game_state['addrs'][username2] = addr2
+            game_state['waiting_reconnect'] = False
+            game_state['last_disconnect_time'] = None
+
         rfile1 = conn1.makefile('r')
         wfile1 = conn1.makefile('w')
         rfile2 = conn2.makefile('r')
@@ -76,7 +182,6 @@ def two_player_game(conn1, addr1, conn2, addr2):
         wfile1.flush()
         wfile2.write(instruction)
         wfile2.flush()
-        # Wrap the wfiles to inject instruction on error
         class WFileWrapper:
             def __init__(self, wfile):
                 self.wfile = wfile
@@ -93,82 +198,122 @@ def two_player_game(conn1, addr1, conn2, addr2):
                 self.wfile.flush()
         def lobby_broadcast(msg):
             with waiting_players_lock:
-                for conn, addr in waiting_lines:
+                for c, a, u in waiting_lines:
                     try:
-                        lobby_wfile = conn.makefile('w')
+                        lobby_wfile = c.makefile('w')
                         lobby_wfile.write(msg + "\n")
                         lobby_wfile.flush()
                     except Exception:
                         pass
+        with player_sessions_lock:
+            player_sessions[username1]['in_game'] = True
+            player_sessions[username2]['in_game'] = True
         game_running.set()
-        try:
+
+        # --- Game state restoration logic ---
+        game_state = games.get(game_key)
+        if not game_state:
+            # New game state
+            board1 = Board(BOARD_SIZE)
+            board2 = Board(BOARD_SIZE)
+            turn = 0
+            placed1 = False
+            placed2 = False
+            games[game_key] = {
+                'board1': board1,
+                'board2': board2,
+                'turn': turn,
+                'placed1': placed1,
+                'placed2': placed2
+            }
+        else:
+            board1 = game_state['board1']
+            board2 = game_state['board2']
+            turn = game_state['turn']
+            placed1 = game_state.get('placed1', False)
+            placed2 = game_state.get('placed2', False)
+
+        # Pass state to battleship logic
+        def save_state_hook(board1, board2, turn, placed1, placed2):
+            games[game_key]['board1'] = board1
+            games[game_key]['board2'] = board2
+            games[game_key]['turn'] = turn
+            games[game_key]['placed1'] = placed1
+            games[game_key]['placed2'] = placed2
+
+        # --- NEW: Wrap run_two_player_game_online to handle disconnects and reconnections ---
+        def player_disconnected_callback(username):
+            game_state = games.get(game_key)
+            if game_state:
+                game_state['connected'][username] = False
+                # --- Set waiting_reconnect immediately on disconnect ---
+                game_state['waiting_reconnect'] = True
+                game_state['last_disconnect_time'] = time.time()
+
+        def run_game():
             run_two_player_game_online(
                 rfile1, WFileWrapper(wfile1),
                 rfile2, WFileWrapper(wfile2),
-                lobby_broadcast=lobby_broadcast
+                lobby_broadcast=lobby_broadcast,
+                usernames=(username1, username2),
+                board1=board1,
+                board2=board2,
+                turn=turn,
+                placed1=placed1,
+                placed2=placed2,
+                save_state_hook=save_state_hook,
+                player_disconnected_callback=player_disconnected_callback
             )
-            print(f"[DEBUG] Finished two player game for {addr1} and {addr2}")
-            # --- After game ends, notify lobby who will play next ---
-            with waiting_players_lock:
-                # Remove any closed/disconnected connections from waiting_lines
-                waiting_lines[:] = [(c, a) for (c, a) in waiting_lines if c.fileno() != -1]
-                # Find the winner if still connected
-                winner_in_lobby = None
-                if len(waiting_lines) > 0:
-                    # If the winner is still in the lobby, they are at the front
-                    winner_in_lobby = waiting_lines[0]
-                # Compose message for lobby
-                if winner_in_lobby:
-                    # Winner is still in the lobby, so next match is winner vs next in queue
-                    if len(waiting_lines) > 1:
-                        next_opponent = waiting_lines[1]
-                        msg = (
-                            f"[LOBBY] Next match: {winner_in_lobby[1]} (last game winner) "
-                            f"vs {next_opponent[1]}. The match will begin in FIVE SECONDS."
+
+        game_thread = threading.Thread(target=run_game)
+        game_thread.start()
+        game_thread.join()
+
+        # --- Wait for possible reconnection if a disconnect occurred ---
+        game_state = games.get(game_key)
+        if game_state:
+            if not all(game_state['connected'].values()):
+                # At least one player disconnected, start timeout for possible reconnection
+                game_state['waiting_reconnect'] = True
+                game_state['last_disconnect_time'] = time.time()
+                for _ in range(RECONNECT_TIMEOUT * 2):  # check every 0.5s
+                    time.sleep(0.5)
+                    if all(game_state['connected'].values()):
+                        # Both reconnected, resume game
+                        print(f"[INFO] Both players reconnected for game {game_key}.")
+                        return two_player_game(
+                            game_state['conns'][game_key[0]], game_state['addrs'][game_key[0]],
+                            game_state['conns'][game_key[1]], game_state['addrs'][game_key[1]],
+                            game_key[0], game_key[1]
                         )
-                    else:
-                        msg = (
-                            f"[LOBBY] Next match: {winner_in_lobby[1]} (last game winner) "
-                            f"awaiting an opponent. The match will begin when another player joins."
-                        )
-                else:
-                    # Winner quit, so next two in queue play
-                    if len(waiting_lines) >= 2:
-                        msg = (
-                            f"[LOBBY] Next match: {waiting_lines[0][1]} vs {waiting_lines[1][1]}. "
-                            "The match will begin in FIVE SECONDS."
-                        )
-                    elif len(waiting_lines) == 1:
-                        msg = (
-                            f"[LOBBY] Next match: {waiting_lines[0][1]} awaiting an opponent. "
-                            "The match will begin when another player joins."
-                        )
-                    else:
-                        msg = "[LOBBY] Waiting for players to join for the next match."
-                # Broadcast to all lobby clients
-                for conn, addr in waiting_lines:
+                # If still not all connected, declare forfeit
+                disconnected = [u for u, c in game_state['connected'].items() if not c]
+                connected = [u for u, c in game_state['connected'].items() if c]
+                if connected and disconnected:
+                    winner = connected[0]
+                    loser = disconnected[0]
                     try:
-                        lobby_wfile = conn.makefile('w')
-                        lobby_wfile.write(msg + "\n")
-                        lobby_wfile.flush()
+                        winner_conn = game_state['conns'][winner]
+                        winner_wfile = winner_conn.makefile('w')
+                        winner_wfile.write("OPPONENT_TIMEOUT. You win!\n")
+                        winner_wfile.flush()
                     except Exception:
                         pass
-        except Exception as e:
-            print(f"[ERROR] Exception during game logic: {e}")
+                    print(f"[INFO] Player {loser} did not reconnect in time. {winner} wins by forfeit.")
+                # --- Mark the game as finished so no further reconnects are allowed ---
+                game_state['waiting_reconnect'] = False
+                del games[game_key]
+            else:
+                # Game finished normally, remove game
+                del games[game_key]
     except Exception as e:
         print(f"[ERROR] Exception during game: {e}")
-        try:
-            wfile1.write("OPPONENT_DISCONNECTED. YOU WIN!\n")
-            wfile1.flush()
-        except Exception:
-            pass
-        try:
-            wfile2.write("OPPONENT_DISCONNECTED. YOU WIN!\n")
-            wfile2.flush()
-        except Exception:
-            pass
+        # --- Remove immediate win/forfeit logic here ---
         print(f"[INFO] Notified remaining player(s) of win and returning to lobby.")
     finally:
+        with player_sessions_lock:
+            player_sessions[username1]['in_game'] = False
+            player_sessions[username2]['in_game'] = False
         try:
             # Remove both players from waiting_lines to prevent infinite rematch loop
             with waiting_players_lock:
@@ -185,8 +330,9 @@ def two_player_game(conn1, addr1, conn2, addr2):
             if both_alive:
                 print(f"[INFO] Both players at {addr1} and {addr2} are still connected, game ended normally.")
                 with waiting_players_lock:
-                    waiting_lines.insert(0, (conn1, addr1))
-                    waiting_lines.append((conn2, addr2))
+                    # FIX: Always append (conn, addr, username)
+                    waiting_lines.insert(0, (conn1, addr1, username1))
+                    waiting_lines.append((conn2, addr2, username2))
                 print(f"[INFO] Two-player game between {addr1} and {addr2} ended. Players returned to lobby if still connected.")
             else:
                 # Improved: check fileno and try to send/recv to determine who is really disconnected
@@ -215,15 +361,22 @@ def two_player_game(conn1, addr1, conn2, addr2):
                     else:
                         disconnected.append((conn, addr))
 
+                # FIX: When requeueing winner, include username
                 if len(still_connected) == 1 and len(disconnected) == 1:
                     winner_conn, winner_addr = still_connected[0]
                     quitter_conn, quitter_addr = disconnected[0]
+                    # Find winner's username
+                    winner_username = None
+                    if (winner_conn, winner_addr) == (conn1, addr1):
+                        winner_username = username1
+                    elif (winner_conn, winner_addr) == (conn2, addr2):
+                        winner_username = username2
                     print(f"[INFO] Player at {winner_addr} WON (opponent timeout/disconnect, waiting for next match or Ctrl+C to exit).")
                     print(f"[INFO] Player at {quitter_addr} QUIT or disconnected during the game or ship placement.")
                     # --- FIX: Requeue the winner for next match ---
                     with waiting_players_lock:
-                        if (winner_conn, winner_addr) not in waiting_lines and winner_conn.fileno() != -1:
-                            waiting_lines.insert(0, (winner_conn, winner_addr))
+                        if (winner_conn, winner_addr, winner_username) not in waiting_lines and winner_conn.fileno() != -1:
+                            waiting_lines.insert(0, (winner_conn, winner_addr, winner_username))
                     try: quitter_conn.close()
                     except Exception: pass
                     print(f"[INFO] Two-player game between {addr1} and {addr2} ended due to disconnect/timeout.")
@@ -253,7 +406,7 @@ def lobby_manager():
         with waiting_players_lock:
             if len(waiting_lines) >= 2 and not game_running.is_set():
                 # Remove any closed/disconnected connections from waiting_lines
-                waiting_lines[:] = [(c, a) for (c, a) in waiting_lines if c.fileno() != -1]
+                waiting_lines[:] = [(c, a, u) for (c, a, u) in waiting_lines if c.fileno() != -1]
                 winner_in_lobby = None
                 if len(waiting_lines) > 0:
                     winner_in_lobby = waiting_lines[0]
@@ -283,7 +436,7 @@ def lobby_manager():
                     else:
                         msg = "[LOBBY] Waiting for players to join for the next match."
                 # Broadcast to all lobby clients, including their queue position
-                for idx, (conn, addr) in enumerate(waiting_lines):
+                for idx, (conn, addr, username) in enumerate(waiting_lines):
                     try:
                         lobby_wfile = conn.makefile('w')
                         pos_msg = f"{msg}\n[LOBBY] You are position {idx+1} in the queue."
@@ -292,19 +445,49 @@ def lobby_manager():
                     except Exception:
                         pass
                 time.sleep(5.0)
-                (conn1, addr1) = waiting_lines.pop(0)
-                (conn2, addr2) = waiting_lines.pop(0)
+                (conn1, addr1, username1) = waiting_lines.pop(0)
+                (conn2, addr2, username2) = waiting_lines.pop(0)
                 print("[INFO] Starting new two player game.")
-                threading.Thread(target=two_player_game, args=(conn1, addr1, conn2, addr2), daemon=True).start()
+                threading.Thread(target=two_player_game, args=(conn1, addr1, conn2, addr2, username1, username2), daemon=True).start()
         threading.Event().wait(0.5) # Sleeps the threaded game if no players
 
 def game_manager(conn, addr, mode):
+    username, conn, addr = handle_initial_connection(conn, addr)
+    if not username:
+        return
+    with player_sessions_lock:
+        player_sessions[username] = {
+            'conn': conn,
+            'addr': addr,
+            'last_active': time.time(),
+            'disconnected': False,
+            'reconnected': False,
+            'in_game': False,
+        }
+    # --- FIX: Allow reconnect if player is marked as disconnected in any waiting_reconnect game ---
+    if mode == "2":
+        for game_key, game_state in games.items():
+            if (
+                username in game_key
+                and game_state.get('waiting_reconnect')
+                and not game_state['connected'][username]
+            ):
+                game_state['connected'][username] = True
+                game_state['conns'][username] = conn
+                game_state['addrs'][username] = addr
+                print(f"[INFO] {username} reconnected to existing game {game_key}.")
+                two_player_game(
+                    game_state['conns'][game_key[0]], game_state['addrs'][game_key[0]],
+                    game_state['conns'][game_key[1]], game_state['addrs'][game_key[1]],
+                    game_key[0], game_key[1]
+                )
+                return
+    # --- NEW: For single player, just play the game ---
     if mode == "1":
-        single_player(conn, addr)
+        single_player(conn, addr, username)
     else:
-        # Only print lobby return message if the player is NOT currently in a game
         with waiting_players_lock:
-            waiting_lines.append((conn, addr))
+            waiting_lines.append((conn, addr, username))
             if game_running.is_set():
                 try:
                     wfile = conn.makefile('w')
