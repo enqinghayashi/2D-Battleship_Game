@@ -9,6 +9,8 @@ Contains core data structures and logic for Battleship, including:
 """
 
 import random
+import time
+import select
 
 BOARD_SIZE = 10
 SHIPS = [
@@ -493,6 +495,12 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
     moves = 0
     turn = 0  # 0 for Player 1's turn, 1 for Player 2's
 
+    # Track last valid move time for each player
+    last_move_time = [time.time(), time.time()]
+    # Get the underlying sockets for select
+    sock1 = rfile1._sock if hasattr(rfile1, "_sock") else rfile1.buffer.raw._sock
+    sock2 = rfile2._sock if hasattr(rfile2, "_sock") else rfile2.buffer.raw._sock
+
     while True:
         if turn == 0:
             rfile, wfile = rfile1, wfile1
@@ -500,26 +508,50 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
             opponent_board = board2
             player_num = 1
             player_board = board1
+            sock = sock1
+            last_idx = 0
         else:
             rfile, wfile = rfile2, wfile2
             opponent_wfile = wfile1
             opponent_board = board1
             player_num = 2
             player_board = board2
-            
+            sock = sock2
+            last_idx = 1
+
         send_my_board(wfile, player_board)
         send_board(wfile, opponent_board)
         send(wfile, "READY")
         send(opponent_wfile, "WAITING")
-        
-        msg = safe_recv(rfile)
+
+        # Wait for input with timeout
+        send(wfile, "You have 30 seconds to make your move.")
+        ready, _, _ = select.select([sock], [], [], 30)
+        if not ready:
+            send(wfile, "TIMEOUT. You forfeited the game.")
+            send(opponent_wfile, "OPPONENT_TIMEOUT. You win!")
+            break
+
+        try:
+            msg = rfile.readline()
+            if not msg:
+                send(wfile, "DISCONNECTED. You forfeited the game.")
+                send(opponent_wfile, "OPPONENT_DISCONNECTED. You win!")
+                break
+            msg = msg.strip()
+        except Exception:
+            send(wfile, "DISCONNECTED. You forfeited the game.")
+            send(opponent_wfile, "OPPONENT_DISCONNECTED. You win!")
+            break
+
+        # Timeout succeeded, update last move time
+        last_move_time[last_idx] = time.time()
+
         if msg.lower() == 'quit':
             send(wfile, "BYE")
             send(opponent_wfile, "OPPONENT_QUIT")
             break
-        
-        
-        
+
         try:
             try:
                 coord = parse_fire_message(msg)
@@ -536,8 +568,8 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
             if not (0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE):
                 send(wfile, f"ERROR Coordinate out of range: {coord}")
                 continue
-            
-            result, sunk_name = opponent_board.fire_at(row, col)       
+
+            result, sunk_name = opponent_board.fire_at(row, col)
             moves += 1
             send(wfile, format_result_message(result, sunk_name))
             if result == 'hit':
