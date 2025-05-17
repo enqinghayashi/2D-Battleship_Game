@@ -545,6 +545,15 @@ def run_two_player_game_online(
                 else:
                     wfile.write(f"ERROR Cannot place {ship_name} at {coord_str} (orientation={orientation_str}). Try again.\n")
                     wfile.flush()
+        # --- Add this block after all ships are placed ---
+        # Notify player if opponent is still placing ships
+        if player_num == 1:
+            other_board = board2
+        else:
+            other_board = board1
+        if len(other_board.placed_ships) < len(SHIPS):
+            wfile.write("WAITING_FOR_OPPONENT_TO_FINISH_PLACING_SHIPS\n")
+            wfile.flush()
         return True
 
     # Place ships (skip if already placed)
