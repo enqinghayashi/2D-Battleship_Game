@@ -65,7 +65,8 @@ def receive_messages(rfile):
         if any(x in line for x in [
             "YOU WIN", "WIN", "LOSE", "OPPONENT_DISCONNECTED", "OPPONENT_TIMEOUT", "BYE"
         ]):
-            messages.append("[INFO] Enter 'continue' to keep playing else Press Ctrl+C to exit")
+            messages.append("[INFO] Looking for next match " 
+            "or press Ctrl+C or type quit to exit")
 
 def display_messages():
     while running:
@@ -111,7 +112,7 @@ def main():
                     wfile.write(user_input + '\n')
                     wfile.flush()
 
-                    if user_input.lower() == "continue":
+                    if user_input.lower() == "quit":
                         running = False
                         break
 

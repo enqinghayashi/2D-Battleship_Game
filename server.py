@@ -35,23 +35,20 @@ def single_player(conn, addr):
 
 def two_player_game(conn1, addr1, conn2, addr2):
     global game_running
-    winner = None
-    loser = None
-    winner_reason = None  # "timeout", "disconnect", "win"
+    winner_conn = None
+    winner_addr = None
     try:
         rfile1 = conn1.makefile('r')
         wfile1 = conn1.makefile('w')
         rfile2 = conn2.makefile('r')
         wfile2 = conn2.makefile('w')
         game_running.set()
-        # Wrap the game logic to detect who won/lost and why
         try:
             run_two_player_game_online(rfile1, wfile1, rfile2, wfile2)
         except Exception as e:
             print(f"[ERROR] Exception during game logic: {e}")
     except Exception as e:
         print(f"[ERROR] Exception during game: {e}")
-        # One or both players disconnected
         try:
             wfile1.write("OPPONENT_DISCONNECTED. YOU WIN!\n")
             wfile1.flush()
@@ -65,93 +62,80 @@ def two_player_game(conn1, addr1, conn2, addr2):
         print(f"[INFO] Notified remaining player(s) of win and returning to lobby.")
     finally:
         try:
-            # Determine who is still connected
-            still_connected = []
-            disconnected = []
-            for conn, addr in [(conn1, addr1), (conn2, addr2)]:
+            # Remove both players from waiting_lines to prevent infinite rematch loop
+            with waiting_players_lock:
+                waiting_lines[:] = [item for item in waiting_lines if item[0] not in (conn1, conn2)]
+            # Only check for disconnects if the game did NOT end normally
+            both_alive = (conn1.fileno() != -1 and conn2.fileno() != -1)
+            # Extra check: try to send a ping to both players to confirm they are really alive
+            if both_alive:
                 try:
-                    conn.setblocking(False)
-                    try:
-                        data = conn.recv(1, socket.MSG_PEEK)
-                        still_connected.append((conn, addr))
-                    except Exception:
-                        disconnected.append((conn, addr))
+                    conn1.send(b"PING\n")
+                    conn2.send(b"PING\n")
                 except Exception:
-                    disconnected.append((conn, addr))
-            # Restore blocking mode for any still connected
-            for conn, _ in still_connected:
-                try: conn.setblocking(True)
-                except Exception: pass
-
-            # Determine winner/loser and reason
-            # If only one is still connected, that player is the winner by disconnect/timeout
-            if len(still_connected) == 1 and len(disconnected) == 1:
-                winner_conn, winner_addr = still_connected[0]
-                loser_conn, loser_addr = disconnected[0]
-                winner = (winner_conn, winner_addr)
-                loser = (loser_conn, loser_addr)
-                winner_reason = "timeout/disconnect"
-                print(f"[INFO] Player at {winner_addr} WON (opponent timeout/disconnect, waiting for next match or Ctrl+C to exit).")
-                print(f"[INFO] Player at {loser_addr} QUIT or disconnected during the game.")
-                # Winner gets priority: insert at front of lobby
-                with waiting_players_lock:
-                    waiting_lines.insert(0, (winner_conn, winner_addr))
-                try: loser_conn.close()
-                except Exception: pass
-            # If both are still connected, the game ended normally (one lost by all ships sunk)
-            elif len(still_connected) == 2:
-                # Ask both clients who won/lost by reading their last message (WIN/LOSE)
-                # But since the game logic already sends WIN/LOSE, we just treat both as still connected
-                # The winner is the one who did NOT receive "LOSE"
-                # For simplicity, push both to lobby, but loser at end, winner at front
+                    both_alive = False
+            if both_alive:
                 print(f"[INFO] Both players at {addr1} and {addr2} are still connected, game ended normally.")
-                # Insert both, winner at front, loser at end
-                # Try to read from their sockets to see who is the winner
-                # (This is a best-effort guess, as the protocol is not strictly stateful)
-                try:
-                    conn1.setblocking(False)
-                    msg1 = conn1.recv(4096, socket.MSG_PEEK).decode(errors="ignore")
-                except Exception:
-                    msg1 = ""
-                try:
-                    conn2.setblocking(False)
-                    msg2 = conn2.recv(4096, socket.MSG_PEEK).decode(errors="ignore")
-                except Exception:
-                    msg2 = ""
-                try: conn1.setblocking(True)
-                except Exception: pass
-                try: conn2.setblocking(True)
-                except Exception: pass
-
-                # Heuristic: if one has "WIN" and the other has "LOSE", use that
-                if "WIN" in msg1 and "LOSE" in msg2:
-                    winner_conn, winner_addr = conn1, addr1
-                    loser_conn, loser_addr = conn2, addr2
-                elif "WIN" in msg2 and "LOSE" in msg1:
-                    winner_conn, winner_addr = conn2, addr2
-                    loser_conn, loser_addr = conn1, addr1
-                else:
-                    # Fallback: just use FIFO, but winner at front
-                    winner_conn, winner_addr = conn1, addr1
-                    loser_conn, loser_addr = conn2, addr2
-
-                print(f"[INFO] Player at {winner_addr} WON (all ships sunk, waiting for next match or Ctrl+C to exit).")
-                print(f"[INFO] Player at {loser_addr} LOST (all ships sunk, added to end of lobby).")
                 with waiting_players_lock:
-                    waiting_lines.insert(0, (winner_conn, winner_addr))
-                    waiting_lines.append((loser_conn, loser_addr))
-            elif len(still_connected) == 0 and len(disconnected) == 2:
-                print(f"[INFO] Both players at {addr1} and {addr2} QUIT or disconnected during the game.")
-                for conn, addr in disconnected:
-                    try: conn.close()
-                    except Exception: pass
+                    waiting_lines.insert(0, (conn1, addr1))
+                    waiting_lines.append((conn2, addr2))
+                print(f"[INFO] Two-player game between {addr1} and {addr2} ended. Players returned to lobby if still connected.")
             else:
-                for conn, addr in disconnected:
-                    print(f"[INFO] Player at {addr} QUIT or disconnected during the game.")
-                    try: conn.close()
-                    except Exception: pass
+                # Improved: check fileno and try to send/recv to determine who is really disconnected
+                still_connected = []
+                disconnected = []
+                for conn, addr in [(conn1, addr1), (conn2, addr2)]:
+                    alive = False
+                    if conn.fileno() != -1:
+                        try:
+                            conn.setblocking(False)
+                            try:
+                                conn.send(b"PING\n")
+                                alive = True
+                            except Exception:
+                                try:
+                                    data = conn.recv(1, socket.MSG_PEEK)
+                                    if data:
+                                        alive = True
+                                except Exception:
+                                    alive = False
+                        finally:
+                            try: conn.setblocking(True)
+                            except Exception: pass
+                    if alive:
+                        still_connected.append((conn, addr))
+                    else:
+                        disconnected.append((conn, addr))
 
-            print(f"[INFO] Two-player game between {addr1} and {addr2} ended. Players returned to lobby if still connected.")
+                if len(still_connected) == 1 and len(disconnected) == 1:
+                    winner_conn, winner_addr = still_connected[0]
+                    quitter_conn, quitter_addr = disconnected[0]
+                    print(f"[INFO] Player at {winner_addr} WON (opponent timeout/disconnect, waiting for next match or Ctrl+C to exit).")
+                    print(f"[INFO] Player at {quitter_addr} QUIT or disconnected during the game or ship placement.")
+                    # --- FIX: Requeue the winner for next match ---
+                    with waiting_players_lock:
+                        if (winner_conn, winner_addr) not in waiting_lines and winner_conn.fileno() != -1:
+                            waiting_lines.insert(0, (winner_conn, winner_addr))
+                    try: quitter_conn.close()
+                    except Exception: pass
+                    print(f"[INFO] Two-player game between {addr1} and {addr2} ended due to disconnect/timeout.")
+                elif len(still_connected) == 0 and len(disconnected) == 2:
+                    print(f"[INFO] Both players at {addr1} and {addr2} QUIT or disconnected during the game or ship placement.")
+                    for conn, addr in disconnected:
+                        try: conn.close()
+                        except Exception: pass
+                    print(f"[INFO] Two-player game between {addr1} and {addr2} ended due to both disconnecting.")
+                elif len(still_connected) == 2:
+                    print(f"[INFO] Both players at {addr1} and {addr2} are still connected (unexpected).")
+                else:
+                    for conn, addr in disconnected:
+                        print(f"[INFO] Player at {addr} QUIT or disconnected during the game or ship placement.")
+                        try: conn.close()
+                        except Exception: pass
+                    for conn, addr in still_connected:
+                        print(f"[INFO] Player at {addr} is still connected.")
+                    print(f"[INFO] Two-player game between {addr1} and {addr2} ended due to disconnect.")
+
             game_running.clear()
         except Exception as e:
             print(f"[ERROR] Error in two-player game setup: {e}")
