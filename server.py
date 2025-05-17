@@ -15,6 +15,7 @@ import threading
 import time
 import queue
 from battleship import run_single_player_game_online, run_two_player_game_online, Board, BOARD_SIZE, SHIPS
+from protocol import build_packet, parse_packet, PKT_TYPE_GAME, PKT_TYPE_CHAT
 
 HOST = '127.0.0.1'
 PORT = 5000
@@ -33,27 +34,60 @@ RECONNECT_TIMEOUT = 60  # seconds
 # --- NEW: Persistent game state storage ---
 games = {}  # (username1, username2): { 'board1': ..., 'board2': ..., 'turn': ..., 'ships1': ..., 'ships2': ..., 'placed1': ..., 'placed2': ... }
 
+def send_packet(conn, seq, pkt_type, msg):
+    """Send a packet with the given sequence, type, and string payload."""
+    payload = msg.encode('utf-8')
+    packet = build_packet(seq, pkt_type, payload)
+    conn.sendall(packet)
+
+def recv_packet(conn):
+    """Receive a packet and return (seq, pkt_type, payload as str)."""
+    # Read header first to get payload length
+    header_size = 7  # 4+1+2
+    header = b''
+    while len(header) < header_size:
+        chunk = conn.recv(header_size - len(header))
+        if not chunk:
+            raise ConnectionError("Client disconnected")
+        header += chunk
+    seq, pkt_type, length = struct.unpack("!IBH", header)
+    payload = b''
+    while len(payload) < length:
+        chunk = conn.recv(length - len(payload))
+        if not chunk:
+            raise ConnectionError("Client disconnected")
+        payload += chunk
+    checksum = b''
+    while len(checksum) < 4:
+        chunk = conn.recv(4 - len(checksum))
+        if not chunk:
+            raise ConnectionError("Client disconnected")
+        checksum += chunk
+    packet = header + payload + checksum
+    try:
+        seq, pkt_type, payload = parse_packet(packet)
+        return seq, pkt_type, payload.decode('utf-8')
+    except Exception as e:
+        # Optionally log or handle checksum error
+        return None, None, None
+
 def handle_initial_connection(conn, addr):
     """
     Handles the initial handshake to get the username.
     Returns (username, conn, addr) or (None, None, None) on failure.
     """
     try:
-        rfile = conn.makefile('r')
-        wfile = conn.makefile('w')
-        line = rfile.readline()
-        if not line:
+        seq = 0
+        seq_recv = 0
+        # Receive USERNAME packet
+        seq_recv, pkt_type, payload = recv_packet(conn)
+        if pkt_type != PKT_TYPE_GAME or not payload.startswith("USERNAME "):
+            send_packet(conn, seq, PKT_TYPE_GAME, "ERROR: Must provide USERNAME <name> as first message.")
             conn.close()
             return None, None, None
-        if not line.startswith("USERNAME "):
-            wfile.write("ERROR: Must provide USERNAME <name> as first message.\n")
-            wfile.flush()
-            conn.close()
-            return None, None, None
-        username = line.strip().split(" ", 1)[1]
+        username = payload.strip().split(" ", 1)[1]
         if not username:
-            wfile.write("ERROR: Username cannot be empty.\n")
-            wfile.flush()
+            send_packet(conn, seq, PKT_TYPE_GAME, "ERROR: Username cannot be empty.")
             conn.close()
             return None, None, None
         return username, conn, addr
@@ -82,32 +116,39 @@ def wait_for_reconnect(username, old_session, mode):
 
 def single_player(conn, addr, username):
     try:
-        rfile = conn.makefile('r')
-        wfile = conn.makefile('w')
+        seq_send = 0
+        seq_recv = 0
         print(f"[DEBUG] Starting single player game for {addr}")
+
+        def send(msg):
+            nonlocal seq_send
+            send_packet(conn, seq_send, PKT_TYPE_GAME, msg)
+            seq_send += 1
+
+        def recv():
+            nonlocal seq_recv
+            s, pkt_type, payload = recv_packet(conn)
+            seq_recv = s
+            return payload
+
         # Add instruction for ship placement
         instruction = (
             "INSTRUCTION: To place a ship, type: place <start_coord> <orientation> <ship_name>\n"
             "Example: place b6 v carrier\n"
         )
-        wfile.write(instruction)
-        wfile.flush()
-        # Wrap the wfile to inject instruction on error
+        send(instruction)
+
         class WFileWrapper:
-            def __init__(self, wfile):
-                self.wfile = wfile
             def write(self, msg):
-                if msg.startswith("ERROR Invalid coordinate:"):
-                    self.wfile.write(msg)
-                    self.wfile.write(
-                        "INSTRUCTION: To place a ship, type: place <start_coord> <orientation> <ship_name>\n"
-                        "Example: place b6 v carrier\n"
-                    )
-                else:
-                    self.wfile.write(msg)
+                send(msg)
             def flush(self):
-                self.wfile.flush()
-        run_single_player_game_online(rfile, WFileWrapper(wfile))
+                pass
+
+        class RFileWrapper:
+            def readline(self):
+                return recv()
+
+        run_single_player_game_online(RFileWrapper(), WFileWrapper())
         print(f"[DEBUG] Finished single player game for {addr}")
     except Exception as e:
         print(f"[WARN] Single player client {addr} ({username}) disconnected: {e}")
@@ -169,33 +210,60 @@ def two_player_game(conn1, addr1, conn2, addr2, username1, username2):
             game_state['waiting_reconnect'] = False
             game_state['last_disconnect_time'] = None
 
-        rfile1 = conn1.makefile('r')
-        wfile1 = conn1.makefile('w')
-        rfile2 = conn2.makefile('r')
-        wfile2 = conn2.makefile('w')
+        seq_send1 = 0
+        seq_recv1 = 0
+        seq_send2 = 0
+        seq_recv2 = 0
+
+        def send1(msg):
+            nonlocal seq_send1
+            send_packet(conn1, seq_send1, PKT_TYPE_GAME, msg)
+            seq_send1 += 1
+
+        def send2(msg):
+            nonlocal seq_send2
+            send_packet(conn2, seq_send2, PKT_TYPE_GAME, msg)
+            seq_send2 += 1
+
+        def recv1():
+            nonlocal seq_recv1
+            s, pkt_type, payload = recv_packet(conn1)
+            seq_recv1 = s
+            return payload
+
+        def recv2():
+            nonlocal seq_recv2
+            s, pkt_type, payload = recv_packet(conn2)
+            seq_recv2 = s
+            return payload
+
+        class WFileWrapper1:
+            def write(self, msg):
+                send1(msg)
+            def flush(self):
+                pass
+
+        class WFileWrapper2:
+            def write(self, msg):
+                send2(msg)
+            def flush(self):
+                pass
+
+        class RFileWrapper1:
+            def readline(self):
+                return recv1()
+
+        class RFileWrapper2:
+            def readline(self):
+                return recv2()
+
         print(f"[DEBUG] Starting two player game for {addr1} and {addr2}")
         instruction = (
             "INSTRUCTION: To place a ship, type: place <start_coord> <orientation> <ship_name>\n"
             "Example: place b6 v carrier\n"
         )
-        wfile1.write(instruction)
-        wfile1.flush()
-        wfile2.write(instruction)
-        wfile2.flush()
-        class WFileWrapper:
-            def __init__(self, wfile):
-                self.wfile = wfile
-            def write(self, msg):
-                if msg.startswith("ERROR Invalid coordinate:"):
-                    self.wfile.write(msg)
-                    self.wfile.write(
-                        "INSTRUCTION: To place a ship, type: place <start_coord> <orientation> <ship_name>\n"
-                        "Example: place b6 v carrier\n"
-                    )
-                else:
-                    self.wfile.write(msg)
-            def flush(self):
-                self.wfile.flush()
+        send1(instruction)
+        send2(instruction)
         def lobby_broadcast(msg):
             with waiting_players_lock:
                 for c, a, u in waiting_lines:
@@ -252,8 +320,8 @@ def two_player_game(conn1, addr1, conn2, addr2, username1, username2):
 
         def run_game():
             run_two_player_game_online(
-                rfile1, WFileWrapper(wfile1),
-                rfile2, WFileWrapper(wfile2),
+                RFileWrapper1(), WFileWrapper1(),
+                RFileWrapper2(), WFileWrapper2(),
                 lobby_broadcast=lobby_broadcast,
                 usernames=(username1, username2),
                 board1=board1,
