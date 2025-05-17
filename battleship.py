@@ -448,10 +448,7 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
     send(wfile1, "PLACE_SHIPS")
     send(wfile2, "PLACE_SHIPS")
 
-    for board, rfile, wfile, player_num in [
-        (board1, rfile1, wfile1, 1),
-        (board2, rfile2, wfile2, 2)
-    ]:
+    def place_ships_for_player(board, rfile, wfile, player_num):
         for ship_name, ship_size in SHIPS:
             while True:
                 send(wfile, f"PLACE {ship_name}(shipName) {ship_size}(shipSize) ")
@@ -480,6 +477,15 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
                         send(wfile, "ERROR Cannot place ship at that location")
                 except Exception as e:
                     send(wfile, f"ERROR {e}")
+
+    # Use threads to allow both players to place ships at the same time
+    import threading
+    t1 = threading.Thread(target=place_ships_for_player, args=(board1, rfile1, wfile1, 1))
+    t2 = threading.Thread(target=place_ships_for_player, args=(board2, rfile2, wfile2, 2))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
 
     send(wfile1, "ALL_SHIPS_PLACED")
     send(wfile2, "ALL_SHIPS_PLACED")
