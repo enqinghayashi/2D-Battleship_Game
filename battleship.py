@@ -520,6 +520,10 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
     sock1 = rfile1._sock if hasattr(rfile1, "_sock") else rfile1.buffer.raw._sock
     sock2 = rfile2._sock if hasattr(rfile2, "_sock") else rfile2.buffer.raw._sock
 
+    # Add a return value to indicate how the game ended and who won/lost
+    # Returns: ("winner", 1 or 2) if a player won, ("timeout", 1 or 2) if timeout/disconnect, ("both_disconnect", None) if both gone
+    winner = None
+    reason = None
     while True:
         if turn == 0:
             rfile, wfile = rfile1, wfile1
@@ -549,6 +553,23 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
         if not ready:
             send(wfile, "TIMEOUT. You forfeited the game.")
             send(opponent_wfile, "OPPONENT_TIMEOUT. You win!")
+            # --- Force disconnect the timed-out player ---
+            try:
+                # Close the timed-out player's file/socket to simulate disconnect
+                if turn == 0:
+                    rfile1.close()
+                    wfile1.close()
+                    sock1.close()
+                    winner = 2
+                    reason = "timeout"
+                else:
+                    rfile2.close()
+                    wfile2.close()
+                    sock2.close()
+                    winner = 1
+                    reason = "timeout"
+            except Exception:
+                pass
             break
 
         try:
@@ -556,11 +577,15 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
             if not msg:
                 send(wfile, "DISCONNECTED. You forfeited the game.")
                 send(opponent_wfile, "OPPONENT_DISCONNECTED. You win!")
+                winner = 2 if turn == 0 else 1
+                reason = "disconnect"
                 break
             msg = msg.strip()
         except Exception:
             send(wfile, "DISCONNECTED. You forfeited the game.")
             send(opponent_wfile, "OPPONENT_DISCONNECTED. You win!")
+            winner = 2 if turn == 0 else 1
+            reason = "disconnect"
             break
 
         # Timeout succeeded, update last move time
@@ -569,25 +594,13 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
         if msg.lower() == 'quit':
             send(wfile, "BYE")
             send(opponent_wfile, "OPPONENT_QUIT")
+            winner = 2 if turn == 0 else 1
+            reason = "disconnect"
             break
 
         try:
-            try:
-                coord = parse_fire_message(msg)
-            except ValueError:
-                send(wfile, "ERROR Invalid FIRE command format. Use 'FIRE A5'")
-                continue
-
-            # validate the coordinates
-            if len(coord) < 2 or not coord[0].isalpha() or not coord[1:].isdigit():
-                send(wfile, f"ERROR Invalid coordinate format: {coord}")
-                continue
-
+            coord = parse_fire_message(msg)
             row, col = parse_coordinate(coord)
-            if not (0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE):
-                send(wfile, f"ERROR Coordinate out of range: {coord}")
-                continue
-
             result, sunk_name = opponent_board.fire_at(row, col)
             moves += 1
             send(wfile, format_result_message(result, sunk_name))
@@ -603,6 +616,8 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
                     send_board(opponent_wfile, opponent_board)
                     send(wfile, f"WIN {moves}")
                     send(opponent_wfile, "LOSE")
+                    winner = 1 if turn == 0 else 2
+                    reason = "win"
                     break
             elif result == 'miss':
                 send(wfile, "MISS")
@@ -610,12 +625,16 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
             elif result == 'already_shot':
                 send(wfile, "ALREADY_SHOT")
                 continue
-            # Switch turns for players
             turn = 1 - turn
         except Exception as e:
             send(wfile, f"ERROR {e}")
             continue
 
+    # --- NEW: return game result for server logic ---
+    if winner is not None:
+        return ("winner", winner, reason)
+    else:
+        return ("both_disconnect", None, None)
 
 if __name__ == "__main__":
     # Optional: run this file as a script to test single-player mode
