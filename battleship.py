@@ -450,13 +450,28 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
     send(wfile1, "PLACE_SHIPS")
     send(wfile2, "PLACE_SHIPS")
 
-    def place_ships_for_player(board, rfile, wfile, player_num):
+    # Shared disconnect flag for both threads
+    disconnect_flag = {"disconnected": False}
+
+    def place_ships_for_player(board, rfile, wfile, player_num, opponent_wfile):
         for ship_name, ship_size in SHIPS:
             while True:
+                if disconnect_flag["disconnected"]:
+                    return
+                send_my_board(wfile, board)
                 send(wfile, f"PLACE {ship_name}(shipName) {ship_size}(shipSize) ")
                 send(wfile, f"Respond something like PLACE <COORD> <ORIENTATION> <SHIPNAME> ")
                 send(wfile, f"e.g. 'place b6 v battleship' v:vertical, h: horizontal ")
-                msg = safe_recv(rfile)
+                try:
+                    msg = safe_recv(rfile)
+                except ConnectionError:
+                    # Mark disconnect and notify opponent
+                    disconnect_flag["disconnected"] = True
+                    try:
+                        send(opponent_wfile, "OPPONENT_DISCONNECTED. YOU WIN!")
+                    except Exception:
+                        pass
+                    return
                 try:
                     coord_str, orientation_str, name = parse_place_message(msg)
                     if name != ship_name.upper():
@@ -482,12 +497,16 @@ def run_two_player_game_online(rfile1, wfile1, rfile2, wfile2):
 
     # Use threads to allow both players to place ships at the same time
     import threading
-    t1 = threading.Thread(target=place_ships_for_player, args=(board1, rfile1, wfile1, 1))
-    t2 = threading.Thread(target=place_ships_for_player, args=(board2, rfile2, wfile2, 2))
+    t1 = threading.Thread(target=place_ships_for_player, args=(board1, rfile1, wfile1, 1, wfile2))
+    t2 = threading.Thread(target=place_ships_for_player, args=(board2, rfile2, wfile2, 2, wfile1))
     t1.start()
     t2.start()
     t1.join()
     t2.join()
+
+    # If a disconnect happened during placement, exit early
+    if disconnect_flag["disconnected"]:
+        return
 
     send(wfile1, "ALL_SHIPS_PLACED")
     send(wfile2, "ALL_SHIPS_PLACED")
