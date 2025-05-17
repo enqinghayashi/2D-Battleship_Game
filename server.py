@@ -92,17 +92,29 @@ def main():
     print(f"[INFO] Server listening on {HOST}:{PORT}")
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((HOST, PORT))
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # keep the server up for running again
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.listen(10)
+        s.settimeout(1.0)
+        lobby_thread = None
         if mode == "2":
-            threading.Thread(target=lobby_manager, daemon=True).start()
-        while True:
-            try:
-                conn, addr = s.accept()
-                print(f"[INFO] Player connected from {addr}")
-                threading.Thread(target=game_manager, args=(conn, addr, mode), daemon=True).start()
-            except Exception as e:
-                print(f"[ERROR] Accept failed: {e}")
+            lobby_thread = threading.Thread(target=lobby_manager)
+            lobby_thread.daemon = True  # Make lobby thread a daemon so it doesn't block exit
+            lobby_thread.start()
+        try:
+            while True:
+                try:
+                    conn, addr = s.accept()
+                    print(f"[INFO] Player connected from {addr}")
+                    threading.Thread(target=game_manager, args=(conn, addr, mode), daemon=True).start()
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    print(f"[ERROR] Accept failed: {e}")
+        except KeyboardInterrupt:
+            print("\n[INFO] Server shutting down (Ctrl+C pressed).")
+            s.close()
+            # No join on daemon thread; process will exit immediately
+            return
 
 # HINT: For multiple clients, you'd need to:
 # 1. Accept connections in a loop
