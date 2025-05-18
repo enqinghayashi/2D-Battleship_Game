@@ -1258,6 +1258,11 @@ def main():
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.listen(10)
         s.settimeout(1.0)
+        
+        # Print instructions about chat feature
+        print("[INFO] Chat feature enabled. Players can chat by typing 'chat <message>'.")
+        print("[INFO] All connected players will receive chat messages, including those in the lobby.")
+        
         lobby_thread = None
         if mode == "2":
             lobby_thread = threading.Thread(target=lobby_manager)
