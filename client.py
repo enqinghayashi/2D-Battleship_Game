@@ -12,6 +12,7 @@ import threading
 import time
 from protocol import build_packet, parse_packet, PKT_TYPE_GAME, PKT_TYPE_CHAT
 import struct
+from protocols.encryption import encrypt_message, decrypt_message
 
 HOST = '127.0.0.1'
 PORT = 5000
@@ -19,8 +20,8 @@ running = True
 messages = []
 
 def send_packet(conn, seq, pkt_type, msg):
-    payload = msg.encode('utf-8')
-    print(f"[DEBUG-CLIENT] -> Sending: seq={seq}, type={pkt_type}, msg={msg}")
+    encrypted = encrypt_message(msg)           
+    payload = encrypted.encode('utf-8')      
     packet = build_packet(seq, pkt_type, payload)
     conn.sendall(packet)
 
@@ -48,7 +49,13 @@ def recv_packet(conn):
     packet = header + payload + checksum
     try:
         seq, pkt_type, payload = parse_packet(packet)
-        print(f"[DEBUG-CLIENT] <- Received: seq={seq}, type={pkt_type}, payload={payload}")
+        try:
+            decrypted = decrypt_message(payload.decode('utf-8'))
+            print(f"[DEBUG-CLIENT] <- Received: seq={seq}, type={pkt_type}, decrypted_payload={decrypted}")
+            return seq, pkt_type, decrypted
+        except Exception as e:
+            print(f"[ERROR] Failed to decrypt payload: {e}")
+            return None, None, None
         return seq, pkt_type, payload.decode('utf-8')
     except Exception as e:
         print(f"[ERROR] Failed to parse packet: {e}")
@@ -60,8 +67,6 @@ def receive_messages(conn):
         try:
             s, pkt_type, line = recv_packet(conn)
             print(f"[DEBUG-CLIENT] Received raw packet: seq={s}, type={pkt_type}, payload={line}")
-
-            
 
 
             # Handle potential full disconnect or critical parsing error first

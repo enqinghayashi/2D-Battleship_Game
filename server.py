@@ -18,6 +18,7 @@ import struct
 import select  # Add this import
 from battleship import run_single_player_game_online, run_two_player_game_online, Board, BOARD_SIZE, SHIPS
 from protocol import build_packet, parse_packet, PKT_TYPE_GAME, PKT_TYPE_CHAT
+from protocols.encryption import encrypt_message, decrypt_message
 
 HOST = '127.0.0.1'
 PORT = 5000
@@ -41,14 +42,14 @@ active_connections_lock = threading.Lock()
 
 def send_packet(conn, seq, pkt_type, msg):
     """Send a packet with the given sequence, type, and string payload."""
-    payload = msg.encode('utf-8')
+    encrypted = encrypt_message(msg)  # encrypt string to base64 string
+    payload = encrypted.encode('utf-8')  # encode to bytes
     packet = build_packet(seq, pkt_type, payload)
     conn.sendall(packet)
 
 def recv_packet(conn):
-    """Receive a packet and return (seq, pkt_type, payload as str)."""
-    # Read header first to get payload length
-    header_size = 7  # 4+1+2
+    """Receive a packet and return (seq, pkt_type, decrypted payload as str)."""
+    header_size = 7
     header = b''
     while len(header) < header_size:
         chunk = conn.recv(header_size - len(header))
@@ -56,25 +57,31 @@ def recv_packet(conn):
             raise ConnectionError("Client disconnected")
         header += chunk
     seq, pkt_type, length = struct.unpack("!IBH", header)
+    
     payload = b''
     while len(payload) < length:
         chunk = conn.recv(length - len(payload))
         if not chunk:
             raise ConnectionError("Client disconnected")
         payload += chunk
+    
     checksum = b''
     while len(checksum) < 4:
         chunk = conn.recv(4 - len(checksum))
         if not chunk:
             raise ConnectionError("Client disconnected")
         checksum += chunk
+
     packet = header + payload + checksum
+
     try:
         seq, pkt_type, payload = parse_packet(packet)
-        return seq, pkt_type, payload.decode('utf-8')
+        decrypted = decrypt_message(payload.decode('utf-8')) 
+        return seq, pkt_type, decrypted
     except Exception as e:
-        # Optionally log or handle checksum error
+        print(f"[ERROR] Failed to parse or decrypt packet: {e}")
         return None, None, None
+
 
 def handle_initial_connection(conn, addr):
     """
