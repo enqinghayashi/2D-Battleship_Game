@@ -1037,74 +1037,43 @@ def recv_packet_handle_chat(conn, username):
     while True:
         try:
             seq, pkt_type, payload = recv_packet(conn)
-        except Exception:
+        except Exception as e:
             # Defensive: treat disconnect as fatal
+            print(f"[EVENT] Exception in recv_packet_handle_chat for {username}: {e}")
             raise ConnectionError("Client disconnected")
+        
         if pkt_type == PKT_TYPE_CHAT:
             # Defensive: decode payload if it's bytes (for robustness)
             if isinstance(payload, bytes):
                 payload = payload.decode('utf-8', errors='ignore')
+            
             if payload is not None and payload.strip() != "":
+                print(f"[EVENT] Received chat message from {username}: '{payload}'")
                 broadcast_chat(username, payload)
+            else:
+                print(f"[EVENT] Received empty chat message from {username}")
+            
             continue  # Wait for next packet
+        
         if pkt_type is None or payload is None:
+            print(f"[EVENT] Received invalid packet (type={pkt_type}, payload={payload}) from {username}")
             raise ConnectionError("Client disconnected")
+        
         return seq, pkt_type, payload
-
-def lobby_manager():
-    while True:
-        with waiting_players_lock:
-            if len(waiting_lines) >= 2 and not game_running.is_set():
-                # Remove any closed/disconnected connections from waiting_lines
-                waiting_lines[:] = [(c, a, u) for (c, a, u) in waiting_lines if c.fileno() != -1]
-                winner_in_lobby = None
-                if len(waiting_lines) > 0:
-                    winner_in_lobby = waiting_lines[0]
-                if winner_in_lobby:
-                    if len(waiting_lines) > 1:
-                        next_opponent = waiting_lines[1]
-                        msg = (
-                            f"[LOBBY] Next match: {winner_in_lobby[1]} (last game winner) "
-                            f"vs {next_opponent[1]}. The match will begin in FIVE SECONDS."
-                        )
-                    else:
-                        msg = (
-                            f"[LOBBY] Next match: {winner_in_lobby[1]} (last game winner) "
-                            f"awaiting an opponent. The match will begin when another player joins."
-                        )
-                else:
-                    if len(waiting_lines) >= 2:
-                        msg = (
-                            f"[LOBBY] Next match: {waiting_lines[0][1]} vs {waiting_lines[1][1]}. "
-                            "The match will begin in FIVE SECONDS."
-                        )
-                    elif len(waiting_lines) == 1:
-                        msg = (
-                            f"[LOBBY] Next match: {waiting_lines[0][1]} awaiting an opponent. "
-                            "The match will begin when another player joins."
-                        )
-                    else:
-                        msg = "[LOBBY] Waiting for players to join for the next match."
-                # Broadcast to all lobby clients, including their queue position
-                for idx, (conn, addr, username) in enumerate(waiting_lines):
-                    try:
-                        # Use protocol for lobby messages
-                        send_packet(conn, idx, PKT_TYPE_GAME, f"{msg}\n[LOBBY] You are position {idx+1} in the queue.")
-                    except Exception:
-                        pass
-                time.sleep(5.0)
-                (conn1, addr1, username1) = waiting_lines.pop(0)
-                (conn2, addr2, username2) = waiting_lines.pop(0)
-                print("[INFO] Starting new two player game.")
-                threading.Thread(target=two_player_game, args=(conn1, addr1, conn2, addr2, username1, username2), daemon=True).start()
-        threading.Event().wait(0.5) # Sleeps the threaded game if no players
 
 def game_manager(conn, addr, mode):
     username, conn, addr = handle_initial_connection(conn, addr)
-    print(f"[DEBUG] game_manager got username: {username}")
+    print(f"[EVENT] game_manager got username: {username}")
     if not username:
-        print(f"[DEBUG] Username handshake failed for {addr}")
+        print(f"[EVENT] Username handshake failed for {addr}")
         return
+
+    # Add connection to active_connections for chat as soon as a valid user connects
+    with active_connections_lock:
+        if conn not in active_connections and conn.fileno() != -1:
+            active_connections.append(conn)
+            print(f"[EVENT] Added {addr} ({username}) to active_connections for chat right after connection")
+
     with player_sessions_lock:
         player_sessions[username] = {
             'conn': conn,
@@ -1142,30 +1111,144 @@ def game_manager(conn, addr, mode):
                 try:
                     # Use protocol for lobby messages
                     send_packet(conn, 0, PKT_TYPE_GAME, "A game is currently in progress. You are in the lobby and will join the next game when it starts.")
+                    send_packet(conn, 0, PKT_TYPE_GAME, "You can chat with 'chat <message>'.")
                 except Exception:
                     print(f"[WARN] Failed to notify player at {addr}")
             else:
                 try:
                     send_packet(conn, 0, PKT_TYPE_GAME, "Waiting for another player to join...")
+                    send_packet(conn, 0, PKT_TYPE_GAME, "You can chat with 'chat <message>'.")
                 except Exception:
                     print(f"[WARN] Failed to notify player at {addr}")
         # Wait for the connection to close (i.e., after a game or disconnect)
         try:
+            seq_recv = 0
             while True:
                 if conn.fileno() == -1:
-                    # Only print if the player is still in the lobby (not matched into a game)
+                    # Connection closed
                     with waiting_players_lock:
-                        if (conn, addr) in waiting_lines:
-                            print(f"[INFO] Player at {addr} QUIT or disconnected while in the lobby.")
-                            waiting_lines.remove((conn, addr))
+                        if any(c == conn for c, _, _ in waiting_lines):
+                            print(f"[INFO] Player at {addr} ({username}) QUIT or disconnected while in the lobby.")
+                            waiting_lines[:] = [(c, a, u) for c, a, u in waiting_lines if c != conn]
+                    
+                    # Also remove from active_connections
+                    with active_connections_lock:
+                        if conn in active_connections:
+                            active_connections.remove(conn)
+                            print(f"[EVENT] Removed {addr} ({username}) from active_connections after disconnect")
                     break
+                
                 with waiting_players_lock:
-                    # Only print if the player is still in the lobby (not matched into a game)
-                    if (conn, addr) not in waiting_lines and conn.fileno() != -1:
+                    # Only process if player is still in waiting_lines
+                    if not any(c == conn for c, _, _ in waiting_lines):
+                        # Player was moved to a game
                         break
-                time.sleep(0.5)
-        except Exception:
-            pass
+                
+                # Poll for messages to handle chat while in lobby
+                try:
+                    conn.setblocking(False)
+                    try:
+                        readable, _, _ = select.select([conn], [], [], 0.5)
+                        if readable:
+                            try:
+                                seq, pkt_type, payload = recv_packet(conn)
+                                if pkt_type == PKT_TYPE_CHAT:
+                                    print(f"[EVENT] Received chat message from {username} in lobby: '{payload}'")
+                                    broadcast_chat(username, payload)
+                            except Exception as e:
+                                print(f"[EVENT] Exception receiving from lobby player {username}: {e}")
+                                # Player disconnected
+                                with waiting_players_lock:
+                                    waiting_lines[:] = [(c, a, u) for c, a, u in waiting_lines if c != conn]
+                                with active_connections_lock:
+                                    if conn in active_connections:
+                                        active_connections.remove(conn)
+                                        print(f"[EVENT] Removed {addr} ({username}) from active_connections after error")
+                                break
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        conn.setblocking(True)
+                    except Exception:
+                        # Socket is likely closed
+                        break
+                
+                time.sleep(0.1) # Short sleep to prevent CPU thrashing
+                
+        except Exception as e:
+            print(f"[EVENT] Exception in game_manager lobby wait for {username}: {e}")
+            # Clean up if player disconnects
+            with waiting_players_lock:
+                waiting_lines[:] = [(c, a, u) for c, a, u in waiting_lines if c != conn]
+            with active_connections_lock:
+                if conn in active_connections:
+                    active_connections.remove(conn)
+
+def lobby_manager():
+    while True:
+        with waiting_players_lock:
+            if len(waiting_lines) >= 2 and not game_running.is_set():
+                # Remove any closed/disconnected connections from waiting_lines
+                waiting_lines[:] = [(c, a, u) for (c, a, u) in waiting_lines if c.fileno() != -1]
+                winner_in_lobby = None
+                if len(waiting_lines) > 0:
+                    winner_in_lobby = waiting_lines[0]
+                if winner_in_lobby:
+                    if len(waiting_lines) > 1:
+                        next_opponent = waiting_lines[1]
+                        msg = (
+                            f"[LOBBY] Next match: {winner_in_lobby[1]} (last game winner) "
+                            f"vs {next_opponent[1]}. The match will begin in FIVE SECONDS."
+                        )
+                    else:
+                        msg = (
+                            f"[LOBBY] Next match: {winner_in_lobby[1]} (last game winner) "
+                            f"awaiting an opponent. The match will begin when another player joins."
+                        )
+                else:
+                    if len(waiting_lines) >= 2:
+                        msg = (
+                            f"[LOBBY] Next match: {waiting_lines[0][1]} vs {waiting_lines[1][1]}. "
+                            "The match will begin in FIVE SECONDS."
+                        )
+                    elif len(waiting_lines) == 1:
+                        msg = (
+                            f"[LOBBY] Next match: {waiting_lines[0][1]} awaiting an opponent. "
+                            "The match will begin when another player joins."
+                        )
+                    else:
+                        msg = "[LOBBY] Waiting for players to join for the next match."
+                
+                print(f"[EVENT] Lobby status: {msg}")
+                
+                # Broadcast to all lobby clients, including their queue position
+                for idx, (conn, addr, username) in enumerate(waiting_lines):
+                    try:
+                        # Use protocol for lobby messages
+                        send_packet(conn, idx, PKT_TYPE_GAME, f"{msg}\n[LOBBY] You are position {idx+1} in the queue.")
+                        # Add a chat reminder message for lobby players
+                        # Remind players they can chat
+                        if len(waiting_lines) > 1:  # Only if there are other players to chat with
+                            send_packet(conn, idx, PKT_TYPE_GAME, "[LOBBY] Remember: You can chat with other players using 'chat <message>'")
+                    except Exception as e:
+                        print(f"[EVENT] Failed to send lobby message to {username} at {addr}: {e}")
+                        pass
+                
+                # If we have enough players, start a game after a delay
+                if len(waiting_lines) >= 2:
+                    print("[EVENT] Starting game countdown...")
+                    time.sleep(5.0)
+                    # Check again after delay in case players disconnected
+                    if len(waiting_lines) >= 2:
+                        (conn1, addr1, username1) = waiting_lines.pop(0)
+                        (conn2, addr2, username2) = waiting_lines.pop(0)
+                        print(f"[INFO] Starting new two player game between {username1} and {username2}.")
+                        threading.Thread(target=two_player_game, args=(conn1, addr1, conn2, addr2, username1, username2), daemon=True).start()
+                        
+                        # Note: No need to add to active_connections here since we already added them when they connected
+        
+        threading.Event().wait(0.5) # Sleep the threaded game if no players
 
 def main():
     mode = input ("Select mode: (1) Single player, (2) Two player: ").strip()
