@@ -20,6 +20,7 @@ messages = []
 
 def send_packet(conn, seq, pkt_type, msg):
     payload = msg.encode('utf-8')
+    print(f"[DEBUG-CLIENT] -> Sending: seq={seq}, type={pkt_type}, msg={msg}")
     packet = build_packet(seq, pkt_type, payload)
     conn.sendall(packet)
 
@@ -47,8 +48,10 @@ def recv_packet(conn):
     packet = header + payload + checksum
     try:
         seq, pkt_type, payload = parse_packet(packet)
+        print(f"[DEBUG-CLIENT] <- Received: seq={seq}, type={pkt_type}, payload={payload}")
         return seq, pkt_type, payload.decode('utf-8')
     except Exception as e:
+        print(f"[ERROR] Failed to parse packet: {e}")
         return None, None, None
 
 def receive_messages(conn):
@@ -56,6 +59,8 @@ def receive_messages(conn):
     while running:
         try:
             s, pkt_type, line = recv_packet(conn)
+            print(f"[DEBUG-CLIENT] Received raw packet: seq={s}, type={pkt_type}, payload={line}")
+
             
 
 
@@ -106,8 +111,7 @@ def display_messages():
     while running:
         while messages:
             print(messages.pop(0))
-        time.sleep(0.05)  # 防止 CPU 占用过高
-
+        time.sleep(0.05)  
             
 def main():
     global running, messages
@@ -144,6 +148,7 @@ def main():
                 # --- Always allow user input, even in lobby ---
                 while running:
                     user_input = input(">> ").strip()
+                    print(f"[DEBUG-CLIENT] Raw input: {user_input}")
                     if not user_input:
                         continue
                     if user_input.lower().startswith("chat "):
@@ -152,6 +157,7 @@ def main():
                         seq_send += 1
                         continue
                     send_packet(s, seq_send, PKT_TYPE_GAME, user_input)
+                    print(f"[DEBUG-CLIENT] Sending packet: seq={seq_send}, type={PKT_TYPE_GAME}, content={user_input}")
                     seq_send += 1
                     if user_input.lower() == "quit":
                         running = False
