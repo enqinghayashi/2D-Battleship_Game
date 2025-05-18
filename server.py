@@ -15,6 +15,8 @@ import threading
 import time
 import queue
 from battleship import run_single_player_game_online, run_two_player_game_online, Board, BOARD_SIZE, SHIPS
+from protocol.encryption import encrypt_message, decrypt_message
+
 
 HOST = '127.0.0.1'
 PORT = 5000
@@ -32,6 +34,23 @@ RECONNECT_TIMEOUT = 60  # seconds
 
 # --- NEW: Persistent game state storage ---
 games = {}  # (username1, username2): { 'board1': ..., 'board2': ..., 'turn': ..., 'ships1': ..., 'ships2': ..., 'placed1': ..., 'placed2': ... }
+def safe_recv(rfile):
+    line = rfile.readline()
+    if not line:
+        raise ConnectionError("Disconnected.")
+    return decrypt_message(line.strip())
+
+class EncryptedWFileWrapper:
+    def __init__(self, wfile):
+        self.wfile = wfile
+
+    def write(self, msg):
+        encrypted = encrypt_message(msg)
+        self.wfile.write(encrypted + '\n')
+
+    def flush(self):
+        self.wfile.flush()
+
 
 def handle_initial_connection(conn, addr):
     """
@@ -40,8 +59,9 @@ def handle_initial_connection(conn, addr):
     """
     try:
         rfile = conn.makefile('r')
-        wfile = conn.makefile('w')
-        line = rfile.readline()
+        wfile = EncryptedWFileWrapper(conn.makefile('w'))
+        encrypted = rfile.readline()
+        line = decrypt_message(encrypted.strip())
         if not line:
             conn.close()
             return None, None, None
@@ -83,7 +103,7 @@ def wait_for_reconnect(username, old_session, mode):
 def single_player(conn, addr, username):
     try:
         rfile = conn.makefile('r')
-        wfile = conn.makefile('w')
+        wfile = EncryptedWFileWrapper(conn.makefile('w'))
         print(f"[DEBUG] Starting single player game for {addr}")
         # Add instruction for ship placement
         instruction = (
@@ -170,9 +190,9 @@ def two_player_game(conn1, addr1, conn2, addr2, username1, username2):
             game_state['last_disconnect_time'] = None
 
         rfile1 = conn1.makefile('r')
-        wfile1 = conn1.makefile('w')
+        wfile1 = EncryptedWFileWrapper(conn1.makefile('w'))
         rfile2 = conn2.makefile('r')
-        wfile2 = conn2.makefile('w')
+        wfile2 = EncryptedWFileWrapper(conn2.makefile('w'))
         print(f"[DEBUG] Starting two player game for {addr1} and {addr2}")
         instruction = (
             "INSTRUCTION: To place a ship, type: place <start_coord> <orientation> <ship_name>\n"
@@ -262,7 +282,9 @@ def two_player_game(conn1, addr1, conn2, addr2, username1, username2):
                 placed1=placed1,
                 placed2=placed2,
                 save_state_hook=save_state_hook,
-                player_disconnected_callback=player_disconnected_callback
+                player_disconnected_callback=player_disconnected_callback,
+                recv1=safe_recv,
+                recv2=safe_recv
             )
 
         game_thread = threading.Thread(target=run_game)
@@ -294,7 +316,7 @@ def two_player_game(conn1, addr1, conn2, addr2, username1, username2):
                     loser = disconnected[0]
                     try:
                         winner_conn = game_state['conns'][winner]
-                        winner_wfile = winner_conn.makefile('w')
+                        winner_wfile = EncryptedWFileWrapper(winner_conn.makefile('w')) 
                         winner_wfile.write("OPPONENT_TIMEOUT. You win!\n")
                         winner_wfile.flush()
                     except Exception:
@@ -438,7 +460,7 @@ def lobby_manager():
                 # Broadcast to all lobby clients, including their queue position
                 for idx, (conn, addr, username) in enumerate(waiting_lines):
                     try:
-                        lobby_wfile = conn.makefile('w')
+                        lobby_wfile = EncryptedWFileWrapper(conn.makefile('w'))
                         pos_msg = f"{msg}\n[LOBBY] You are position {idx+1} in the queue."
                         lobby_wfile.write(pos_msg + "\n")
                         lobby_wfile.flush()
@@ -490,17 +512,17 @@ def game_manager(conn, addr, mode):
             waiting_lines.append((conn, addr, username))
             if game_running.is_set():
                 try:
-                    wfile = conn.makefile('w')
+                    wfile = EncryptedWFileWrapper(conn.makefile('w'))
                     wfile.write("A game is currently in progress. You are in the lobby and will join the next game when it starts.\n")
                     wfile.flush()
-                except Exception:
+                except Exception as e:
                     print(f"[WARN] Failed to notify player at {addr}: {e}")
             else:
                 try:
-                    wfile = conn.makefile('w')
+                    wfile = EncryptedWFileWrapper(conn.makefile('w'))
                     wfile.write("Waiting for another player to join...\n")
                     wfile.flush()
-                except Exception:
+                except Exception as e:
                     print(f"[WARN] Failed to notify player at {addr}: {e}")
         # Wait for the connection to close (i.e., after a game or disconnect)
         try:

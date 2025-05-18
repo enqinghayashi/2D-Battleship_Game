@@ -10,6 +10,8 @@ TODO: Fix the message synchronization issue using concurrency (Tier 1, item 1).
 import socket
 import threading
 import time
+from protocol.encryption import encrypt_message, decrypt_message
+
 
 HOST = '127.0.0.1'
 PORT = 5000
@@ -36,7 +38,10 @@ def receive_messages(rfile):
             running = False
             break
 
-        line = line.strip()
+        try:
+            line = decrypt_message(line.strip())
+        except Exception:
+            line = "[ERROR] Could not decrypt from server."
         
         
         if line == "MY_BOARD":
@@ -90,7 +95,8 @@ def main():
             wfile = s.makefile('w')
 
             # Send username for identification
-            wfile.write(f"USERNAME {username}\n")
+            encrypted_username = encrypt_message(f"USERNAME {username}")
+            wfile.write(encrypted_username + '\n')
             wfile.flush()
 
             print("Connected to server. Waiting for game to start...")
@@ -98,7 +104,7 @@ def main():
             if initial_msg:
                 print(initial_msg)
             
-            # Start threading and receive messages.
+            # Start threading and receive messagegit s.
             running = True
             threading.Thread(target=receive_messages, args=(rfile,), daemon=True).start()
             threading.Thread(target=display_messages, daemon=True).start()
@@ -118,7 +124,8 @@ def main():
                     if not user_input:
                         continue
                     
-                    wfile.write(user_input + '\n')
+                    encrypted = encrypt_message(user_input)
+                    wfile.write(encrypted + '\n')
                     wfile.flush()
 
                     if user_input.lower() == "quit":

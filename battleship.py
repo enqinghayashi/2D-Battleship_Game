@@ -12,6 +12,8 @@ import random
 import time
 import select
 import threading  # <-- Add this import at the top
+from protocol.encryption import decrypt_message
+
 
 BOARD_SIZE = 10
 SHIPS = [
@@ -366,8 +368,10 @@ def run_single_player_game_online(rfile, wfile):
         
     def recv():
         try:
-            if rfile.readline().strip():
-                return rfile.readline().strip()
+            line = rfile.readline()
+            if not line:
+                raise ConnectionError("Player disconnected from the game")
+            return decrypt_message(line.strip())
         except Exception:
             raise ConnectionError("Player disconnected from the game")
 
@@ -400,7 +404,7 @@ def run_single_player_game_online(rfile, wfile):
 def run_two_player_game_online(
     rfile1, wfile1, rfile2, wfile2, lobby_broadcast=None, usernames=None,
     board1=None, board2=None, turn=0, placed1=False, placed2=False, save_state_hook=None,
-    player_disconnected_callback=None
+    player_disconnected_callback=None,recv1=None, recv2=None
 ):
     """
     Runs a two-player online Battleship game.
@@ -408,6 +412,10 @@ def run_two_player_game_online(
     Reports hit/miss/sunk, ends when one player has all ships sunk or forfeits.
     Uses minimal protocol messages: PLACE, FIRE, RESULT, WIN, etc.
     """
+    if recv1 is None:
+        recv1 = safe_recv
+    if recv2 is None:
+        recv2 = safe_recv
     def send(wfile, msg):
         try:
             wfile.write(msg + '\n')
@@ -444,7 +452,7 @@ def run_two_player_game_online(
             line = rfile.readline()
             if not line:
                 raise ConnectionError("Opponent disconnected from the game")
-            return line.strip()
+            return decrypt_message(line.strip())
         except Exception:
             raise ConnectionError("Opponent disconnected from the game")
 
@@ -620,11 +628,11 @@ def run_two_player_game_online(
             break
 
         try:
-            msg = rfile.readline()
-            if not msg:
+            try:
+                msg = recv1(rfile1)  if turn == 0 else recv2(rfile2)
+            except ConnectionError:
                 disconnect_and_pause(player_num)
                 break
-            msg = msg.strip()
         except Exception:
             disconnect_and_pause(player_num)
             break
