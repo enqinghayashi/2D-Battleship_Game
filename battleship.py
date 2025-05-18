@@ -476,6 +476,20 @@ def run_two_player_game_online(
         disconnect_flag["disconnected"] = True
         disconnect_flag["who"] = player_num
         disconnect_event.set()
+        # --- Send INFO to both players about reconnect window ---
+        try:
+            if player_num == 1:
+                wfile2.write("INFO: Opponent disconnected. Waiting up to 60 seconds for them to reconnect...\n")
+                wfile2.flush()
+                wfile1.write("INFO: You have been disconnected. If you reconnect within 60 seconds, you can resume the game.\n")
+                wfile1.flush()
+            else:
+                wfile1.write("INFO: Opponent disconnected. Waiting up to 60 seconds for them to reconnect...\n")
+                wfile1.flush()
+                wfile2.write("INFO: You have been disconnected. If you reconnect within 60 seconds, you can resume the game.\n")
+                wfile2.flush()
+        except Exception:
+            pass
         time.sleep(0.1)
 
     # Ship placement, skip if already placed
@@ -582,8 +596,17 @@ def run_two_player_game_online(
     # turn = 0  # already set from argument
 
     last_move_time = [time.time(), time.time()]
-    sock1 = rfile1._sock if hasattr(rfile1, "_sock") else rfile1.buffer.raw._sock
-    sock2 = rfile2._sock if hasattr(rfile2, "_sock") else rfile2.buffer.raw._sock
+    # --- Get underlying socket for select.select ---
+    sock1 = None
+    sock2 = None
+    try:
+        sock1 = rfile1._sock if hasattr(rfile1, "_sock") else rfile1.buffer.raw._sock
+    except Exception:
+        pass
+    try:
+        sock2 = rfile2._sock if hasattr(rfile2, "_sock") else rfile2.buffer.raw._sock
+    except Exception:
+        pass
 
     while True:
         if turn == 0:
@@ -610,23 +633,28 @@ def run_two_player_game_online(
         broadcast_lobby(f"[LOBBY] Player {player_num}'s turn. Waiting for move...")
 
         send(wfile, "You have 30 seconds to make your move.")
-        ready, _, _ = select.select([sock], [], [], 30)
-        if not ready:
-            send(wfile, "TIMEOUT. You forfeited the game.")
-            send(opponent_wfile, "OPPONENT_TIMEOUT. You win!")
-            broadcast_lobby(f"[LOBBY] Player {player_num} timed out. Opponent wins!")
-            try:
-                if turn == 0:
-                    rfile1.close()
-                    wfile1.close()
-                    sock1.close()
-                else:
-                    rfile2.close()
-                    wfile2.close()
-                    sock2.close()
-            except Exception:
-                pass
-            break
+        # --- Use select.select for timeout ---
+        if sock:
+            ready, _, _ = select.select([sock], [], [], 30)
+            if not ready:
+                send(wfile, "TIMEOUT. You forfeited the game.")
+                send(opponent_wfile, "OPPONENT_TIMEOUT. You win!")
+                broadcast_lobby(f"[LOBBY] Player {player_num} timed out. Opponent wins!")
+                try:
+                    if turn == 0:
+                        rfile1.close()
+                        wfile1.close()
+                        sock1.close()
+                    else:
+                        rfile2.close()
+                        wfile2.close()
+                        sock2.close()
+                except Exception:
+                    pass
+                break
+        else:
+            # Fallback: no socket, just block for input (should not happen in normal usage)
+            pass
 
         try:
             msg = rfile.readline()

@@ -139,10 +139,11 @@ def main():
                     seq_send += 1
                     if user_input.lower() == "quit":
                         running = False
+                        
                         break
             except KeyboardInterrupt:
                 running = False
-                print("\n[INFO] Client exiting.")
+                print("\n[INFO] Client exiting \n You have been disconnected. If you reconnect within 60 seconds, you can resume the game..")
                 break
         print("[INFO] Disconnected or game ended. Reconnecting to server...")
         time.sleep(1)
