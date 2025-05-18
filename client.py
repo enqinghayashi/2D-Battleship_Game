@@ -56,6 +56,9 @@ def receive_messages(conn):
     while running:
         try:
             s, pkt_type, line = recv_packet(conn)
+            if pkt_type == PKT_TYPE_CHAT and line is not None:
+                print(f"[CHAT] {line.strip()}")
+                continue
             if line is None:
                 messages.append("[INFO] Server disconnected.")
                 running = False
@@ -128,18 +131,20 @@ def main():
             messages.clear()
 
             try:
+                # --- Always allow user input, even in lobby ---
                 while running:
-                    time.sleep(0.1)
-                    if messages:
-                        continue
                     user_input = input(">> ").strip()
                     if not user_input:
+                        continue
+                    if user_input.lower().startswith("chat "):
+                        chat_msg = user_input[5:].strip()
+                        send_packet(s, seq_send, PKT_TYPE_CHAT, chat_msg)
+                        seq_send += 1
                         continue
                     send_packet(s, seq_send, PKT_TYPE_GAME, user_input)
                     seq_send += 1
                     if user_input.lower() == "quit":
                         running = False
-                        
                         break
             except KeyboardInterrupt:
                 running = False

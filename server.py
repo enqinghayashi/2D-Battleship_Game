@@ -35,6 +35,9 @@ RECONNECT_TIMEOUT = 60  # seconds
 # --- NEW: Persistent game state storage ---
 games = {}  # (username1, username2): { 'board1': ..., 'board2': ..., 'turn': ..., 'ships1': ..., 'ships2': ..., 'placed1': ..., 'placed2': ... }
 
+active_connections = []
+active_connections_lock = threading.Lock()
+
 def send_packet(conn, seq, pkt_type, msg):
     """Send a packet with the given sequence, type, and string payload."""
     payload = msg.encode('utf-8')
@@ -132,7 +135,7 @@ def single_player(conn, addr, username):
 
         def recv():
             nonlocal seq_recv
-            s, pkt_type, payload = recv_packet(conn)
+            s, pkt_type, payload = recv_packet_handle_chat(conn, username)
             seq_recv = s
             return payload
 
@@ -232,13 +235,13 @@ def two_player_game(conn1, addr1, conn2, addr2, username1, username2):
 
         def recv1():
             nonlocal seq_recv1
-            s, pkt_type, payload = recv_packet(conn1)
+            s, pkt_type, payload = recv_packet_handle_chat(conn1, username1)
             seq_recv1 = s
             return payload
 
         def recv2():
             nonlocal seq_recv2
-            s, pkt_type, payload = recv_packet(conn2)
+            s, pkt_type, payload = recv_packet_handle_chat(conn2, username2)
             seq_recv2 = s
             return payload
 
@@ -510,6 +513,41 @@ def two_player_game(conn1, addr1, conn2, addr2, username1, username2):
             game_running.clear()
         except Exception as e:
             print(f"[ERROR] Error in two-player game setup: {e}")
+
+def broadcast_chat(sender_username, message):
+    # Defensive: ensure message is str
+    if isinstance(message, bytes):
+        message = message.decode('utf-8', errors='ignore')
+    packet = build_packet(0, PKT_TYPE_CHAT, f"{sender_username}: {message}".encode('utf-8'))
+    with active_connections_lock:
+        # Defensive: remove closed connections
+        to_remove = []
+        for conn in active_connections:
+            try:
+                conn.sendall(packet)
+            except Exception:
+                to_remove.append(conn)
+        for conn in to_remove:
+            active_connections.remove(conn)
+
+def recv_packet_handle_chat(conn, username):
+    """Receive a packet, handle chat packets inline, and return only game packets."""
+    while True:
+        try:
+            seq, pkt_type, payload = recv_packet(conn)
+        except Exception:
+            # Defensive: treat disconnect as fatal
+            raise ConnectionError("Client disconnected")
+        if pkt_type == PKT_TYPE_CHAT:
+            # Defensive: decode payload if it's bytes (for robustness)
+            if isinstance(payload, bytes):
+                payload = payload.decode('utf-8', errors='ignore')
+            if payload is not None and payload.strip() != "":
+                broadcast_chat(username, payload)
+            continue  # Wait for next packet
+        if pkt_type is None or payload is None:
+            raise ConnectionError("Client disconnected")
+        return seq, pkt_type, payload
 
 def lobby_manager():
     while True:
