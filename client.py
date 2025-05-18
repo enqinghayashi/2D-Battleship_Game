@@ -10,6 +10,8 @@ TODO: Fix the message synchronization issue using concurrency (Tier 1, item 1).
 import socket
 import threading
 import time
+from protocol.encryption import encrypt_message, decrypt_message
+
 from protocol import build_packet, parse_packet, PKT_TYPE_GAME, PKT_TYPE_CHAT
 import struct
 
@@ -73,7 +75,12 @@ def receive_messages(conn):
                 messages.append("[INFO] Server disconnected.")
                 running = False
                 break
-            line = line.strip()
+        try:
+            line = decrypt_message(line.strip())
+        except Exception as e:
+            if line.strip() == "PING":
+                continue
+            line = "[ERROR] Could not decrypt from server."
             
             if line == "MY_BOARD":
                 messages.append("\n[Your Board]")
@@ -102,12 +109,12 @@ def receive_messages(conn):
             running = False
             break
 
+
 def display_messages():
     while running:
         while messages:
             print(messages.pop(0))
-        time.sleep(0.05)  # 防止 CPU 占用过高
-
+        time.sleep(0.05)  
             
 def main():
     global running, messages
@@ -123,13 +130,19 @@ def main():
             seq_recv = 0
 
             # Send username for identification
-            send_packet(s, seq_send, PKT_TYPE_GAME, f"USERNAME {username}")
+            encrypted_username = encrypt_message(f"USERNAME {username}")
+            send_packet(s, seq_send, PKT_TYPE_GAME, encrypted_username)
             seq_send += 1
 
             # Wait for initial server message
-            s_, pkt_type, initial_msg = recv_packet(s)
-            if initial_msg:
-                print(initial_msg.strip())
+            s_, pkt_type, encrypted_initial_msg = recv_packet(s)
+            if encrypted_initial_msg:
+                try:
+                    print(decrypt_message(encrypted_initial_msg).strip())  # Start threading and receive messages.
+
+                except Exception as e:
+                    print("[ERROR] Could not decrypt initial message:", e)
+        
 
             running = True
             threading.Thread(target=receive_messages, args=(s,), daemon=True).start()
@@ -148,11 +161,14 @@ def main():
                         continue
                     if user_input.lower().startswith("chat "):
                         chat_msg = user_input[5:].strip()
-                        send_packet(s, seq_send, PKT_TYPE_CHAT, chat_msg)
+                        encrypted_chat_msg = encrypt_message(chat_msg)
+                        send_packet(s, seq_send, PKT_TYPE_CHAT, encrypted_chat_msg)
                         seq_send += 1
                         continue
-                    send_packet(s, seq_send, PKT_TYPE_GAME, user_input)
+                    encrypted_user_input = encrypt_message(user_input)
+                    send_packet(s, seq_send, PKT_TYPE_GAME, encrypted_user_input)
                     seq_send += 1
+
                     if user_input.lower() == "quit":
                         running = False
                         break

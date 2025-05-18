@@ -12,6 +12,8 @@ import random
 import time
 import select
 import threading  # <-- Add this import at the top
+from protocol.encryption import decrypt_message
+
 
 BOARD_SIZE = 10
 SHIPS = [
@@ -366,8 +368,10 @@ def run_single_player_game_online(rfile, wfile):
         
     def recv():
         try:
-            if rfile.readline().strip():
-                return rfile.readline().strip()
+            line = rfile.readline().strip()
+            if not line:
+                raise ConnectionError("Player disconnected from the game")
+            return decrypt_message(line)
         except Exception:
             raise ConnectionError("Player disconnected from the game")
 
@@ -408,6 +412,8 @@ def run_two_player_game_online(
     Reports hit/miss/sunk, ends when one player has all ships sunk or forfeits.
     Uses minimal protocol messages: PLACE, FIRE, RESULT, WIN, etc.
     """
+
+        
     def send(wfile, msg):
         try:
             wfile.write(msg + '\n')
@@ -444,7 +450,7 @@ def run_two_player_game_online(
             line = rfile.readline()
             if not line:
                 raise ConnectionError("Opponent disconnected from the game")
-            return line.strip()
+            return decrypt_message(line.strip())
         except Exception:
             raise ConnectionError("Opponent disconnected from the game")
 
@@ -657,11 +663,11 @@ def run_two_player_game_online(
             pass
 
         try:
-            msg = rfile.readline()
-            if not msg:
+            try:
+                msg = recv1(rfile1)  if turn == 0 else recv2(rfile2)
+            except ConnectionError:
                 disconnect_and_pause(player_num)
                 break
-            msg = msg.strip()
         except Exception:
             disconnect_and_pause(player_num)
             break
@@ -709,4 +715,3 @@ def run_two_player_game_online(
         except Exception as e:
             send(wfile, f"ERROR {e}")
             continue
-    # ...existing code...
