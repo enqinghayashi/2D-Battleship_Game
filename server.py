@@ -34,18 +34,30 @@ RECONNECT_TIMEOUT = 60  # seconds
 
 # --- NEW: Persistent game state storage ---
 games = {}  # (username1, username2): { 'board1': ..., 'board2': ..., 'turn': ..., 'ships1': ..., 'ships2': ..., 'placed1': ..., 'placed2': ... }
+
 def safe_recv(rfile):
     line = rfile.readline()
     if not line:
         raise ConnectionError("Disconnected.")
-    return decrypt_message(line.strip())
+    raw = line.strip()
+    print(f"[DEBUG] safe_recv raw: {raw}") 
 
+    try:
+        decrypted = decrypt_message(raw)
+        print(f"[DEBUG] safe_recv decrypted: {decrypted}")
+        return decrypted
+    except Exception as e:
+        print(f"[DECRYPT-ERROR] in safe_recv | raw={raw} | error={e}")
+        raise
+
+# Encrypts messages written to the socket
 class EncryptedWFileWrapper:
     def __init__(self, wfile):
         self.wfile = wfile
 
     def write(self, msg):
         encrypted = encrypt_message(msg)
+        print(f"[DEBUG] sending encrypted: {msg}") 
         self.wfile.write(encrypted + '\n')
 
     def flush(self):
@@ -220,8 +232,8 @@ def two_player_game(conn1, addr1, conn2, addr2, username1, username2):
             with waiting_players_lock:
                 for c, a, u in waiting_lines:
                     try:
-                        lobby_wfile = c.makefile('w')
-                        lobby_wfile.write(msg + "\n")
+                        lobby_wfile = EncryptedWFileWrapper(c.makefile('w'))
+                        lobby_wfile.write(msg)
                         lobby_wfile.flush()
                     except Exception:
                         pass

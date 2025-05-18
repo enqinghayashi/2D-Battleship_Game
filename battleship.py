@@ -416,6 +416,7 @@ def run_two_player_game_online(
         recv1 = safe_recv
     if recv2 is None:
         recv2 = safe_recv
+        
     def send(wfile, msg):
         try:
             wfile.write(msg + '\n')

@@ -13,10 +13,6 @@ def encrypt_message(message: str, key: bytes = SHARED_KEY) -> str:
     ciphertext = encryptor.update(message.encode()) + encryptor.finalize()
     encoded = base64.b64encode(iv + ciphertext).decode() # Put IV and ciphertext together and use base64 to transfer
 
-    # testing print out
-    print(f"[ENCRYPT] msg='{message}'")
-    print(f"[ENCRYPT] iv={iv.hex()} | ciphertext={ciphertext.hex()}")
-    print(f"[ENCRYPT] encoded={encoded}")
     return encoded
 
 # To decrypt all messages, receive the combination of iv and ciphertext
@@ -28,10 +24,7 @@ def decrypt_message(encoded: str, key: bytes = SHARED_KEY) -> str:
     decryptor = cipher.decryptor()
     message = (decryptor.update(ciphertext) + decryptor.finalize()).decode()
 
-    # Print out the output to testing
-    print(f"[DECRYPT] encoded={encoded}")
-    print(f"[DECRYPT] iv={iv.hex()} | ciphertext={ciphertext.hex()}")
-    print(f"[DECRYPT] msg='{message}'")
+ 
     return message
 
 

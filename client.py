@@ -40,7 +40,9 @@ def receive_messages(rfile):
 
         try:
             line = decrypt_message(line.strip())
-        except Exception:
+        except Exception as e:
+            if line.strip() == "PING":
+                continue
             line = "[ERROR] Could not decrypt from server."
         
         
@@ -102,9 +104,12 @@ def main():
             print("Connected to server. Waiting for game to start...")
             initial_msg = rfile.readline().strip()
             if initial_msg:
-                print(initial_msg)
+                try:
+                    print(decrypt_message(initial_msg))
+                except Exception as e:
+                    print("[ERROR] Could not decrypt initial message:", e)
             
-            # Start threading and receive messagegit s.
+            # Start threading and receive messages.
             running = True
             threading.Thread(target=receive_messages, args=(rfile,), daemon=True).start()
             threading.Thread(target=display_messages, daemon=True).start()
