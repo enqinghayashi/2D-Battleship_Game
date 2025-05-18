@@ -12,79 +12,112 @@ import threading
 import time
 from protocol.encryption import encrypt_message, decrypt_message
 
+from protocol import build_packet, parse_packet, PKT_TYPE_GAME, PKT_TYPE_CHAT
+import struct
 
 HOST = '127.0.0.1'
 PORT = 5000
 running = True
 messages = []
 
-# HINT: The current problem is that the client is reading from the socket,
-# then waiting for user input, then reading again. This causes server
-# messages to appear out of order.
-#
-# Consider using Python's threading module to separate the concerns:
-# - One thread continuously reads from the socket and displays messages
-# - The main thread handles user input and sends it to the server
-#
-# import threading
+def send_packet(conn, seq, pkt_type, msg):
+    payload = msg.encode('utf-8')
+    packet = build_packet(seq, pkt_type, payload)
+    conn.sendall(packet)
 
-# Keep receiving messages and store into messages first
-def receive_messages(rfile):
+def recv_packet(conn):
+    header_size = 7
+    header = b''
+    while len(header) < header_size:
+        chunk = conn.recv(header_size - len(header))
+        if not chunk:
+            raise ConnectionError("Server disconnected")
+        header += chunk
+    seq, pkt_type, length = struct.unpack("!IBH", header)
+    payload = b''
+    while len(payload) < length:
+        chunk = conn.recv(length - len(payload))
+        if not chunk:
+            raise ConnectionError("Server disconnected")
+        payload += chunk
+    checksum = b''
+    while len(checksum) < 4:
+        chunk = conn.recv(4 - len(checksum))
+        if not chunk:
+            raise ConnectionError("Server disconnected")
+        checksum += chunk
+    packet = header + payload + checksum
+    try:
+        seq, pkt_type, payload = parse_packet(packet)
+        return seq, pkt_type, payload.decode('utf-8')
+    except Exception as e:
+        return None, None, None
+
+def receive_messages(conn):
     global messages, running
     while running:
-        line = rfile.readline()
-        if not line:
-            messages.append("[INFO] Server disconnected.")
-            running = False
-            break
+        try:
+            s, pkt_type, line = recv_packet(conn)
+            
 
+
+            # Handle potential full disconnect or critical parsing error first
+            if line is None and pkt_type is None: # Indicates error from parse_packet or true disconnect
+                if running: # Avoid appending if already stopped by other means
+                    messages.append("[INFO] Server disconnected or sent invalid data.")
+                    running = False
+                break
+
+            if pkt_type == PKT_TYPE_CHAT and line is not None:
+                messages.append(f"[CHAT] {line.strip()}") # Append formatted chat to messages list
+                continue
+            if line is None:
+                messages.append("[INFO] Server disconnected.")
+                running = False
+                break
         try:
             line = decrypt_message(line.strip())
         except Exception as e:
             if line.strip() == "PING":
                 continue
             line = "[ERROR] Could not decrypt from server."
-        
-        
-        if line == "MY_BOARD":
-            messages.append("\n[Your Board]")
-            while True:
-                board_line = rfile.readline()
-                if not board_line or board_line.strip() == "":
-                    break
-                messages.append(board_line.strip())
-        
-        # Determine if a grid, store the whole grid in messages. 
-        if line == "GRID":
-            # Begin reading board lines
-            messages.append("\n[Board]")
-            while True:
-                empty_line = rfile.readline()
-                if not empty_line or empty_line.strip() == "": #End loop if empty line detected
-                    break
-                messages.append(empty_line.strip())
-        else:
-            # Normal message
-            messages.append(line)
+            
+            if line == "MY_BOARD":
+                messages.append("\n[Your Board]")
+                while True:
+                    s, pkt_type, board_line = recv_packet(conn)
+                    if not board_line or board_line.strip() == "":
+                        break
+                    messages.append(board_line.strip())
+            
+            if line == "GRID":
+                messages.append("\n[Board]")
+                while True:
+                    s, pkt_type, empty_line = recv_packet(conn)
+                    if not empty_line or empty_line.strip() == "":
+                        break
+                    messages.append(empty_line.strip())
+            else:
+                messages.append(line)
+            if any(x in line for x in [
+                "YOU WIN", "WIN", "LOSE", "OPPONENT_DISCONNECTED", "OPPONENT_TIMEOUT", "BYE"
+            ]):
+                messages.append("[INFO] Looking for next match "
+                "or press Ctrl+C or type quit to exit")
+        except Exception:
+            messages.append("[INFO] Server disconnected.")
+            running = False
+            break
 
-        # Do NOT break or reset on win/lose/disconnect messages.
-        # Just notify the user and keep the client running.
-        if any(x in line for x in [
-            "YOU WIN", "WIN", "LOSE", "OPPONENT_DISCONNECTED", "OPPONENT_TIMEOUT", "BYE"
-        ]):
-            messages.append("[INFO] Looking for next match " 
-            "or press Ctrl+C or type quit to exit")
 
 def display_messages():
     while running:
         while messages:
             print(messages.pop(0))
-        time.sleep(0.05)  # 防止 CPU 占用过高
-
+        time.sleep(0.05)  
             
 def main():
     global running, messages
-
     username = input("Enter your username: ").strip()
     if not username:
         print("Username cannot be empty.")
@@ -93,71 +126,58 @@ def main():
     while True:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((HOST, PORT))
-            rfile = s.makefile('r')
-            wfile = s.makefile('w')
+            seq_send = 0
+            seq_recv = 0
 
             # Send username for identification
             encrypted_username = encrypt_message(f"USERNAME {username}")
-            wfile.write(encrypted_username + '\n')
-            wfile.flush()
+            send_packet(s, seq_send, PKT_TYPE_GAME, encrypted_username)
+            seq_send += 1
 
-            print("Connected to server. Waiting for game to start...")
-            initial_msg = rfile.readline().strip()
-            if initial_msg:
+            # Wait for initial server message
+            s_, pkt_type, encrypted_initial_msg = recv_packet(s)
+            if encrypted_initial_msg:
                 try:
-                    print(decrypt_message(initial_msg))
+                    print(decrypt_message(encrypted_initial_msg).strip())  # Start threading and receive messages.
+
                 except Exception as e:
                     print("[ERROR] Could not decrypt initial message:", e)
-            
-            # Start threading and receive messages.
+        
+
             running = True
-            threading.Thread(target=receive_messages, args=(rfile,), daemon=True).start()
+            threading.Thread(target=receive_messages, args=(s,), daemon=True).start()
             threading.Thread(target=display_messages, daemon=True).start()
 
-            # waiting for the welcome messages first
             time.sleep(0.3)
             for m in messages:
                 print(m)
             messages.clear()
 
             try:
+                # --- Always allow user input, even in lobby ---
                 while running:
-                    time.sleep(0.1)
-                    if messages:
-                        continue
                     user_input = input(">> ").strip()
                     if not user_input:
                         continue
-                    
-                    encrypted = encrypt_message(user_input)
-                    wfile.write(encrypted + '\n')
-                    wfile.flush()
+                    if user_input.lower().startswith("chat "):
+                        chat_msg = user_input[5:].strip()
+                        encrypted_chat_msg = encrypt_message(chat_msg)
+                        send_packet(s, seq_send, PKT_TYPE_CHAT, encrypted_chat_msg)
+                        seq_send += 1
+                        continue
+                    encrypted_user_input = encrypt_message(user_input)
+                    send_packet(s, seq_send, PKT_TYPE_GAME, encrypted_user_input)
+                    seq_send += 1
 
                     if user_input.lower() == "quit":
                         running = False
                         break
-
             except KeyboardInterrupt:
                 running = False
-                print("\n[INFO] Client exiting.")
+                print("\n[INFO] Client exiting \n You have been disconnected. If you reconnect within 60 seconds, you can resume the game..")
                 break
-        # After disconnect/game end, loop back to reconnect and wait for new game
         print("[INFO] Disconnected or game ended. Reconnecting to server...")
         time.sleep(1)
 
-# HINT: A better approach would be something like:s(rfile):
-##     """Continuously receive and display messages from the server"""
-# def receive_messages(rfile):
-#     """Continuously receive and display messages from the server"""         line = rfile.readline()
-#     while running:
-#         line = rfile.readline()
-#         if not line:
-#             print("[INFO] Server disconnected.")he message
-#             break
-#         # Process and display the message
-#ection
-# def main():es
-#     # Set up connection     # Main thread handles sending user input
-#     # Start a thread for receiving messages
-#     # Main thread handles sending user input:
-if __name__ == "__main__":    main()
+if __name__ == "__main__":
+    main()
