@@ -56,8 +56,18 @@ def receive_messages(conn):
     while running:
         try:
             s, pkt_type, line = recv_packet(conn)
+            
+
+
+            # Handle potential full disconnect or critical parsing error first
+            if line is None and pkt_type is None: # Indicates error from parse_packet or true disconnect
+                if running: # Avoid appending if already stopped by other means
+                    messages.append("[INFO] Server disconnected or sent invalid data.")
+                    running = False
+                break
+
             if pkt_type == PKT_TYPE_CHAT and line is not None:
-                print(f"[CHAT] {line.strip()}")
+                messages.append(f"[CHAT] {line.strip()}") # Append formatted chat to messages list
                 continue
             if line is None:
                 messages.append("[INFO] Server disconnected.")
