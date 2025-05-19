@@ -18,6 +18,9 @@ import struct
 import select  # Add this import
 from battleship import run_single_player_game_online, run_two_player_game_online, Board, BOARD_SIZE, SHIPS
 from protocol import build_packet, parse_packet, PKT_TYPE_GAME, PKT_TYPE_CHAT
+from cryptography.fernet import Fernet
+fernet_key = b'my_super_secret_aes_256_key_32bb' 
+session_tokens = {} 
 
 HOST = '127.0.0.1'
 PORT = 5000
@@ -91,6 +94,14 @@ def handle_initial_connection(conn, addr):
             conn.close()
             return None, None, None
         username = payload.strip().split(" ", 1)[1]
+        with player_sessions_lock:
+            if username in player_sessions:
+                session = player_sessions[username]
+                if not session.get('disconnected', False) and addr != session.get('addr'):
+                    send_packet(conn, seq, PKT_TYPE_GAME, "ERROR: This username is already in use.")
+                    conn.close()
+                    return None, None, None
+
         if not username:
             send_packet(conn, seq, PKT_TYPE_GAME, "ERROR: Username cannot be empty.")
             conn.close()
@@ -568,35 +579,6 @@ def recv_packet_handle_chat(conn, username):
             raise ConnectionError("Client disconnected")
         
         return seq, pkt_type, payload
-
-def handle_initial_connection(conn, addr):
-    """
-    Handles the initial handshake to get the username.
-    Returns (username, conn, addr) or (None, None, None) on failure.
-    """
-    try:
-        seq = 0
-        seq_recv = 0
-        # Receive USERNAME packet
-        seq_recv, pkt_type, payload = recv_packet(conn)
-        if pkt_type != PKT_TYPE_GAME or not payload.startswith("USERNAME "):
-            send_packet(conn, seq, PKT_TYPE_GAME, "ERROR: Must provide USERNAME <name> as first message.")
-            conn.close()
-            return None, None, None
-        username = payload.strip().split(" ", 1)[1]
-        if not username:
-            send_packet(conn, seq, PKT_TYPE_GAME, "ERROR: Username cannot be empty.")
-            conn.close()
-            return None, None, None
-        print(f"[EVENT] Received username: {username} from {addr}")
-        # --- Send a protocol welcome/lobby message immediately after handshake ---
-        send_packet(conn, seq+1, PKT_TYPE_GAME, "WELCOME! Waiting for game to start...")
-        return username, conn, addr
-    except Exception as e:
-        print(f"[EVENT] Exception in handle_initial_connection: {e}")
-        try: conn.close()
-        except: pass
-        return None, None, None
 
 def wait_for_reconnect(username, old_session, mode):
     """
