@@ -551,34 +551,6 @@ def broadcast_chat(sender_username, message):
             print(f"[EVENT] Removing dead connection from active_connections")
             active_connections.remove(conn)
 
-def recv_packet_handle_chat(conn, username):
-    """Receive a packet, handle chat packets inline, and return only game packets."""
-    while True:
-        try:
-            seq, pkt_type, payload = recv_packet(conn)
-        except Exception as e:
-            # Defensive: treat disconnect as fatal
-            print(f"[EVENT] Exception in recv_packet_handle_chat for {username}: {e}")
-            raise ConnectionError("Client disconnected")
-        
-        if pkt_type == PKT_TYPE_CHAT:
-            # Defensive: decode payload if it's bytes (for robustness)
-            if isinstance(payload, bytes):
-                payload = payload.decode('utf-8', errors='ignore')
-            
-            if payload is not None and payload.strip() != "":
-                print(f"[EVENT] Received chat message from {username}: '{payload}'")
-                broadcast_chat(username, payload)
-            else:
-                print(f"[EVENT] Received empty chat message from {username}")
-            
-            continue  # Wait for next packet
-        
-        if pkt_type is None or payload is None:
-            print(f"[EVENT] Received invalid packet (type={pkt_type}, payload={payload}) from {username}")
-            raise ConnectionError("Client disconnected")
-        
-        return seq, pkt_type, payload
 
 def wait_for_reconnect(username, old_session, mode):
     """
