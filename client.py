@@ -106,7 +106,7 @@ def display_messages():
     while running:
         while messages:
             print(messages.pop(0))
-        time.sleep(0.05)  # 防止 CPU 占用过高
+        time.sleep(0.05)
 
             
 def main():
@@ -130,7 +130,9 @@ def main():
             s_, pkt_type, initial_msg = recv_packet(s)
             if initial_msg:
                 print(initial_msg.strip())
-
+                if initial_msg.startswith("ERROR:"):
+                    print("[CLIENT] Server rejected the connection. Exiting.")
+                    return
             running = True
             threading.Thread(target=receive_messages, args=(s,), daemon=True).start()
             threading.Thread(target=display_messages, daemon=True).start()
