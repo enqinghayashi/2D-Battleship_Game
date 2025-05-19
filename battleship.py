@@ -340,10 +340,17 @@ def run_single_player_game_locally():
             print("  >> Invalid input:", e)
 
 
-def run_single_player_game_online(rfile, wfile):
+def run_single_player_game_online(rfile, wfile, board=None, moves=0, save_state_hook=None):
     """
     A test harness for running the single-player game with I/O redirected to socket file objects.
     Uses minimal protocol messages: FIRE <coord>, RESULT <result>, etc.
+    
+    Parameters:
+    - rfile: file-like object for reading from the client
+    - wfile: file-like object for writing to the client
+    - board: optional Board object for resuming a game
+    - moves: number of moves already made in a resumed game
+    - save_state_hook: callback function to save game state
     """
     def send(msg):
         try:
@@ -371,11 +378,14 @@ def run_single_player_game_online(rfile, wfile):
         except Exception:
             raise ConnectionError("Player disconnected from the game")
 
-    board = Board(BOARD_SIZE)
-    board.place_ships_randomly(SHIPS)
+    # Use provided board or create a new one
+    if board is None:
+        board = Board(BOARD_SIZE)
+        board.place_ships_randomly(SHIPS)
+        if save_state_hook:
+            save_state_hook(board, moves)
 
     send("WELCOME")
-    moves = 0
     while True:
         send_board(board)
         send("READY")  # Prompt client to FIRE
@@ -389,6 +399,11 @@ def run_single_player_game_online(rfile, wfile):
             result, sunk_name = board.fire_at(row, col)
             moves += 1
             send(format_result_message(result, sunk_name))
+            
+            # Save game state after each move
+            if save_state_hook:
+                save_state_hook(board, moves)
+                
             if result == 'hit' and board.all_ships_sunk():
                 send_board(board)
                 send(f"WIN {moves}")

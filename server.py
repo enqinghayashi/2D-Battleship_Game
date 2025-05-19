@@ -39,6 +39,10 @@ games = {}  # (username1, username2): { 'board1': ..., 'board2': ..., 'turn': ..
 active_connections = []
 active_connections_lock = threading.Lock()
 
+# Add single player game states dictionary
+single_player_games = {}  # username: {'board': board, 'ships_placed': bool, 'game_started': bool}
+single_player_games_lock = threading.Lock()
+
 def send_packet(conn, seq, pkt_type, msg):
     """Send a packet with the given sequence, type, and string payload."""
     payload = msg.encode('utf-8')
@@ -157,8 +161,45 @@ def single_player(conn, addr, username):
             def readline(self):
                 return recv()
 
-        run_single_player_game_online(RFileWrapper(), WFileWrapper())
+        # Check if we have a saved game state for this player
+        restored_game = False
+        board = None
+        with single_player_games_lock:
+            if username in single_player_games:
+                game_state = single_player_games[username]
+                if game_state.get('game_started', False):
+                    board = game_state.get('board')
+                    ships_placed = game_state.get('ships_placed', False)
+                    restored_game = True
+                    print(f"[INFO] Restoring saved game for {username}")
+                    # Send game restoration message to client
+                    send("GAME_RESTORED: Your previous game state has been restored.")
+                    if ships_placed:
+                        send("SHIPS_PLACED: Your ships have been restored to their previous positions.")
+                    else:
+                        send("SHIPS_NOT_PLACED: You need to place your ships.")
+
+        # Define a hook to save the game state during gameplay
+        def save_state_hook(board, ships_placed, game_started):
+            with single_player_games_lock:
+                single_player_games[username] = {
+                    'board': board,
+                    'ships_placed': ships_placed,
+                    'game_started': game_started,
+                    'last_updated': time.time()
+                }
+            print(f"[INFO] Saved game state for {username}")
+
+        # Run the game with the restored board if available
+        run_single_player_game_online(RFileWrapper(), WFileWrapper(), board=board, save_state_hook=save_state_hook)
         print(f"[EVENT] Finished single player game for {addr}")
+        
+        # If game completed successfully, clean up the saved state
+        with single_player_games_lock:
+            if username in single_player_games:
+                del single_player_games[username]
+                print(f"[INFO] Removed completed game state for {username}")
+                
     except Exception as e:
         print(f"[WARN] Single player client {addr} ({username}) disconnected: {e}")
         # Wait for reconnection
@@ -168,8 +209,7 @@ def single_player(conn, addr, username):
         new_conn, new_addr = wait_for_reconnect(username, player_sessions[username], mode="1")
         if new_conn:
             print(f"[INFO] {username} reconnected from {new_addr}. Resuming game.")
-            # TODO: Restore game state if needed (for single player, may need to persist board)
-            # For now, just restart a new game
+
             single_player(new_conn, new_addr, username)
         else:
             print(f"[INFO] {username} did not reconnect in time. Forfeiting game.")
