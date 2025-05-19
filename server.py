@@ -45,510 +45,87 @@ def send_packet(conn, seq, pkt_type, msg):
     packet = build_packet(seq, pkt_type, payload)
     conn.sendall(packet)
 
-def recv_packet(conn):
-    """Receive a packet and return (seq, pkt_type, payload as str)."""
-    # Read header first to get payload length
+def recv_packet(conn, terminate_event=None):
+    """
+    Receive a packet and return (seq, pkt_type, payload as str).
+    Uses select for interruptible reads if terminate_event is provided.
+    """
     header_size = 7  # 4+1+2
-    header = b''
-    while len(header) < header_size:
-        chunk = conn.recv(header_size - len(header))
-        if not chunk:
-            raise ConnectionError("Client disconnected")
-        header += chunk
-    seq, pkt_type, length = struct.unpack("!IBH", header)
-    payload = b''
-    while len(payload) < length:
-        chunk = conn.recv(length - len(payload))
-        if not chunk:
-            raise ConnectionError("Client disconnected")
-        payload += chunk
-    checksum = b''
-    while len(checksum) < 4:
-        chunk = conn.recv(4 - len(checksum))
-        if not chunk:
-            raise ConnectionError("Client disconnected")
-        checksum += chunk
-    packet = header + payload + checksum
-    try:
-        seq, pkt_type, payload = parse_packet(packet)
-        return seq, pkt_type, payload.decode('utf-8')
-    except Exception as e:
-        # Optionally log or handle checksum error
-        return None, None, None
-
-def handle_initial_connection(conn, addr):
-    """
-    Handles the initial handshake to get the username.
-    Returns (username, conn, addr) or (None, None, None) on failure.
-    """
-    try:
-        seq = 0
-        seq_recv = 0
-        # Receive USERNAME packet
-        seq_recv, pkt_type, payload = recv_packet(conn)
-        if pkt_type != PKT_TYPE_GAME or not payload.startswith("USERNAME "):
-            send_packet(conn, seq, PKT_TYPE_GAME, "ERROR: Must provide USERNAME <name> as first message.")
-            conn.close()
-            return None, None, None
-        username = payload.strip().split(" ", 1)[1]
-        if not username:
-            send_packet(conn, seq, PKT_TYPE_GAME, "ERROR: Username cannot be empty.")
-            conn.close()
-            return None, None, None
-        print(f"[EVENT] Received username: {username} from {addr}")
-        # --- Send a protocol welcome/lobby message immediately after handshake ---
-        send_packet(conn, seq+1, PKT_TYPE_GAME, "WELCOME! Waiting for game to start...")
-        return username, conn, addr
-    except Exception as e:
-        print(f"[EVENT] Exception in handle_initial_connection: {e}")
-        try: conn.close()
-        except: pass
-        return None, None, None
-
-def wait_for_reconnect(username, old_session, mode):
-    """
-    Waits up to RECONNECT_TIMEOUT seconds for the player to reconnect.
-    Returns new (conn, addr) if reconnected, else None.
-    """
-    start_time = time.time()
-    while time.time() - start_time < RECONNECT_TIMEOUT:
-        with player_sessions_lock:
-            session = player_sessions.get(username)
-            if session and session.get('reconnected'):
-                # Got a new connection
-                conn = session['conn']
-                addr = session['addr']
-                session['reconnected'] = False  # Reset for future disconnects
-                return conn, addr
-        time.sleep(0.5)
-    return None, None
-
-def single_player(conn, addr, username):
-    try:
-        seq_send = 0
-        seq_recv = 0
-        print(f"[EVENT] Starting single player game for {addr}")
-
-        def send(msg):
-            nonlocal seq_send
-            send_packet(conn, seq_send, PKT_TYPE_GAME, msg)
-            seq_send += 1
-
-        def recv():
-            nonlocal seq_recv
-            s, pkt_type, payload = recv_packet_handle_chat(conn, username)
-            seq_recv = s
-            return payload
-
-        # Add instruction for ship placement
-        instruction = (
-            "INSTRUCTION: To place a ship, type: place <start_coord> <orientation> <ship_name>\n"
-            "Example: place b6 v carrier\n"
-        )
-        send(instruction)
-
-        class WFileWrapper:
-            def write(self, msg):
-                send(msg)
-            def flush(self):
-                pass
-
-        class RFileWrapper:
-            def readline(self):
-                return recv()
-
-        run_single_player_game_online(RFileWrapper(), WFileWrapper())
-        print(f"[EVENT] Finished single player game for {addr}")
-    except Exception as e:
-        print(f"[WARN] Single player client {addr} ({username}) disconnected: {e}")
-        # Wait for reconnection
-        with player_sessions_lock:
-            player_sessions[username]['disconnected'] = True
-        print(f"[INFO] Waiting {RECONNECT_TIMEOUT}s for {username} to reconnect...")
-        new_conn, new_addr = wait_for_reconnect(username, player_sessions[username], mode="1")
-        if new_conn:
-            print(f"[INFO] {username} reconnected from {new_addr}. Resuming game.")
-            # TODO: Restore game state if needed (for single player, may need to persist board)
-            # For now, just restart a new game
-            single_player(new_conn, new_addr, username)
-        else:
-            print(f"[INFO] {username} did not reconnect in time. Forfeiting game.")
-    finally:
-        conn.close()
-        print(f"[INFO] Single player client {addr} ({username}) connection closed.")
-
-def two_player_game(conn1, addr1, conn2, addr2, username1, username2):
-    global game_running
-    winner_conn = None
-    winner_addr = None
-    last_winner_addr = None
-    game_key = tuple(sorted([username1, username2]))
-    try:
-        # --- NEW: Mark both players as connected in game state ---
-        game_state = games.get(game_key)
-        if not game_state:
-            board1 = Board(BOARD_SIZE)
-            board2 = Board(BOARD_SIZE)
-            turn = 0
-            placed1 = False
-            placed2 = False
-            games[game_key] = {
-                'board1': board1,
-                'board2': board2,
-                'turn': turn,
-                'placed1': placed1,
-                'placed2': placed2,
-                'connected': {username1: True, username2: True},
-                'conns': {username1: conn1, username2: conn2},
-                'addrs': {username1: addr1, username2: addr2},
-                'waiting_reconnect': False,
-                'last_disconnect_time': None
-            }
-        else:
-            board1 = game_state['board1']
-            board2 = game_state['board2']
-            turn = game_state['turn']
-            placed1 = game_state.get('placed1', False)
-            placed2 = game_state.get('placed2', False)
-            game_state['connected'][username1] = True
-            game_state['connected'][username2] = True
-            game_state['conns'][username1] = conn1
-            game_state['conns'][username2] = conn2
-            game_state['addrs'][username1] = addr1
-            game_state['addrs'][username2] = addr2
-            game_state['waiting_reconnect'] = False
-            game_state['last_disconnect_time'] = None
-
-        seq_send1 = 0
-        seq_recv1 = 0
-        seq_send2 = 0
-        seq_recv2 = 0
-
-        def send1(msg):
-            nonlocal seq_send1
-            send_packet(conn1, seq_send1, PKT_TYPE_GAME, msg)
-            seq_send1 += 1
-
-        def send2(msg):
-            nonlocal seq_send2
-            send_packet(conn2, seq_send2, PKT_TYPE_GAME, msg)
-            seq_send2 += 1
-
-        def recv1():
-            nonlocal seq_recv1
-            s, pkt_type, payload = recv_packet_handle_chat(conn1, username1)
-            seq_recv1 = s
-            return payload
-
-        def recv2():
-            nonlocal seq_recv2
-            s, pkt_type, payload = recv_packet_handle_chat(conn2, username2)
-            seq_recv2 = s
-            return payload
-
-        class WFileWrapper1:
-            def write(self, msg):
-                send1(msg)
-            def flush(self):
-                pass
-
-        class WFileWrapper2:
-            def write(self, msg):
-                send2(msg)
-            def flush(self):
-                pass
-
-        class RFileWrapper1:
-            def readline(self):
-                return recv1()
-
-        class RFileWrapper2:
-            def readline(self):
-                return recv2()
-
-        print(f"[EVENT] Starting two player game for {addr1} and {addr2}")
-        instruction = (
-            "INSTRUCTION: To place a ship, type: place <start_coord> <orientation> <ship_name>\n"
-            "Example: place b6 v carrier\n"
-        )
-        send1(instruction)
-        send2(instruction)
-        def lobby_broadcast(msg):
-            with waiting_players_lock:
-                for c, a, u in waiting_lines:
-                    try:
-                        lobby_wfile = c.makefile('w')
-                        lobby_wfile.write(msg + "\n")
-                        lobby_wfile.flush()
-                    except Exception:
-                        pass
-        with player_sessions_lock:
-            player_sessions[username1]['in_game'] = True
-            player_sessions[username2]['in_game'] = True
-        game_running.set()
-
-        # --- Game state restoration logic ---
-        game_state = games.get(game_key)
-        if not game_state:
-            # New game state
-            board1 = Board(BOARD_SIZE)
-            board2 = Board(BOARD_SIZE)
-            turn = 0
-            placed1 = False
-            placed2 = False
-            games[game_key] = {
-                'board1': board1,
-                'board2': board2,
-                'turn': turn,
-                'placed1': placed1,
-                'placed2': placed2
-            }
-        else:
-            board1 = game_state['board1']
-            board2 = game_state['board2']
-            turn = game_state['turn']
-            placed1 = game_state.get('placed1', False)
-            placed2 = game_state.get('placed2', False)
-
-        # Pass state to battleship logic
-        def save_state_hook(board1, board2, turn, placed1, placed2):
-            games[game_key]['board1'] = board1
-            games[game_key]['board2'] = board2
-            games[game_key]['turn'] = turn
-            games[game_key]['placed1'] = placed1
-            games[game_key]['placed2'] = placed2
-
-        # --- NEW: Wrap run_two_player_game_online to handle disconnects and reconnections ---
-        def player_disconnected_callback(username):
-            game_state = games.get(game_key)
-            if game_state:
-                game_state['connected'][username] = False
-                # --- Set waiting_reconnect immediately on disconnect ---
-                game_state['waiting_reconnect'] = True
-                game_state['last_disconnect_time'] = time.time()
-
-        def send_info_to_players(disconnected, connected, game_state):
-            try:
-                if disconnected and connected:
-                    loser = disconnected[0]
-                    winner = connected[0]
-                    loser_conn = game_state['conns'][loser]
-                    winner_conn = game_state['conns'][winner]
-                    winner_conn.sendall(build_packet(0, PKT_TYPE_GAME, b"INFO: Opponent disconnected. Waiting up to 60 seconds for them to reconnect..."))
-                    try:
-                        loser_conn.sendall(build_packet(0, PKT_TYPE_GAME, b"INFO: You have been disconnected. If you reconnect within 60 seconds, you can resume the game."))
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        # --- NEW: Use a dedicated function to run the game logic ---
-        def run_game():
-            run_two_player_game_online(
-                RFileWrapper1(), WFileWrapper1(),
-                RFileWrapper2(), WFileWrapper2(),
-                lobby_broadcast=lobby_broadcast,
-                usernames=(username1, username2),
-                board1=board1,
-                board2=board2,
-                turn=turn,
-                placed1=placed1,
-                placed2=placed2,
-                save_state_hook=save_state_hook,
-                player_disconnected_callback=player_disconnected_callback
-            )
-
-        game_thread = threading.Thread(target=run_game)
-        game_thread.start()
-
-        # --- Monitor disconnects while the game is running ---
-        game_state = games.get(game_key)
-        disconnect_timeout_started = False
-        disconnect_start_time = None
-        disconnected_user = None
-        connected_user = None
-
-        while True:
-            if not game_thread.is_alive():
-                break
-            if game_state:
-                disconnected = [u for u, c in game_state['connected'].items() if not c]
-                connected = [u for u, c in game_state['connected'].items() if c]
-                # Start timeout as soon as one player disconnects
-                if not disconnect_timeout_started and len(disconnected) == 1 and len(connected) == 1:
-                    disconnect_timeout_started = True
-                    disconnect_start_time = time.time()
-                    disconnected_user = disconnected[0]
-                    connected_user = connected[0]
-                    print(f"[INFO] Waiting 60s for {disconnected_user} to reconnect...")
-                    send_info_to_players([disconnected_user], [connected_user], game_state)
-                # If timeout started, check for reconnect or timeout expiry
-                if disconnect_timeout_started:
-                    # If both disconnected, break immediately
-                    if len(connected) == 0 and len(disconnected) == 2:
-                        print(f"[INFO] Both players at {addr1} and {addr2} QUIT or disconnected during the game or ship placement.")
-                        break
-                    # If reconnected, resume game
-                    if all(game_state['connected'].values()):
-                        print(f"[INFO] {', '.join(game_state['connected'].keys())} reconnected for game {game_key}.")
-                        print(f"[INFO] Both players reconnected for game {game_key}.")
-                        disconnect_timeout_started = False
-                        disconnect_start_time = None
-                        disconnected_user = None
-                        connected_user = None
-                    # If timeout expired, forfeit
-                    elif time.time() - disconnect_start_time >= RECONNECT_TIMEOUT:
-                        print(f"[INFO] {disconnected_user} did not reconnect in time. {connected_user} wins by forfeit.")
-                        try:
-                            winner_conn = game_state['conns'][connected_user]
-                            winner_addr = game_state['addrs'][connected_user]
-                            winner_username = connected_user
-                            winner_conn.sendall(build_packet(0, PKT_TYPE_GAME, b"OPPONENT_TIMEOUT. You win!"))
-                        except Exception:
-                            winner_conn = None
-                            winner_addr = None
-                            winner_username = None
-                        # End the game and requeue the winner for next match
-                        game_state['waiting_reconnect'] = False
-                        del games[game_key]
-                        if winner_conn and winner_conn.fileno() != -1:
-                            with waiting_players_lock:
-                                if (winner_conn, winner_addr, winner_username) not in waiting_lines:
-                                    waiting_lines.insert(0, (winner_conn, winner_addr, winner_username))
-                        # --- Immediately break so lobby_manager can match the winner ---
-                        break
-            time.sleep(0.5)
-
-        # --- Cleanup and lobby requeue logic ---
-    except Exception as e:
-        print(f"[ERROR] Exception during game: {e}")
-        # --- Remove immediate win/forfeit logic here ---
-        print(f"[INFO] Notified remaining player(s) of win and returning to lobby.")
-    finally:
-        with player_sessions_lock:
-            player_sessions[username1]['in_game'] = False
-            player_sessions[username2]['in_game'] = False
-        try:
-            # Remove both players from waiting_lines to prevent infinite rematch loop
-            with waiting_players_lock:
-                waiting_lines[:] = [item for item in waiting_lines if item[0] not in (conn1, conn2)]
-            # Only check for disconnects if the game did NOT end normally
-            both_alive = (conn1.fileno() != -1 and conn2.fileno() != -1)
-            # Extra check: try to send a ping to both players to confirm they are really alive
-            if both_alive:
-                try:
-                    conn1.send(b"PING\n")
-                    conn2.send(b"PING\n")
-                except Exception:
-                    both_alive = False
-            if both_alive:
-                print(f"[INFO] Both players at {addr1} and {addr2} are still connected, game ended normally.")
-                with waiting_players_lock:
-                    # FIX: Always append (conn, addr, username)
-                    waiting_lines.insert(0, (conn1, addr1, username1))
-                    waiting_lines.append((conn2, addr2, username2))
-                print(f"[INFO] Two-player game between {addr1} and {addr2} ended. Players returned to lobby if still connected.")
-            else:
-                # Improved: check fileno and try to send/recv to determine who is really disconnected
-                still_connected = []
-                disconnected = []
-                for conn, addr in [(conn1, addr1), (conn2, addr2)]:
-                    alive = False
-                    if conn.fileno() != -1:
-                        try:
-                            conn.setblocking(False)
-                            try:
-                                conn.send(b"PING\n")
-                                alive = True
-                            except Exception:
-                                try:
-                                    data = conn.recv(1, socket.MSG_PEEK)
-                                    if data:
-                                        alive = True
-                                except Exception:
-                                    alive = False
-                        finally:
-                            try: conn.setblocking(True)
-                            except Exception: pass
-                    if alive:
-                        still_connected.append((conn, addr))
-                    else:
-                        disconnected.append((conn, addr))
-
-                # FIX: When requeueing winner, include username
-                if len(still_connected) == 1 and len(disconnected) == 1:
-                    winner_conn, winner_addr = still_connected[0]
-                    quitter_conn, quitter_addr = disconnected[0]
-                    # Find winner's username
-                    winner_username = None
-                    if (winner_conn, winner_addr) == (conn1, addr1):
-                        winner_username = username1
-                    elif (winner_conn, winner_addr) == (conn2, addr2):
-                        winner_username = username2
-                    print(f"[INFO] Player at {winner_addr} WON (opponent timeout/disconnect, waiting for next match or Ctrl+C to exit).")
-                    print(f"[INFO] Player at {quitter_addr} QUIT or disconnected during the game or ship placement.")
-                    # --- FIX: Requeue the winner for next match ---
-                    with waiting_players_lock:
-                        if (winner_conn, winner_addr, winner_username) not in waiting_lines and winner_conn.fileno() != -1:
-                            waiting_lines.insert(0, (winner_conn, winner_addr, winner_username))
-                    try: quitter_conn.close()
-                    except Exception: pass
-                    print(f"[INFO] Two-player game between {addr1} and {addr2} ended due to disconnect/timeout.")
-                elif len(still_connected) == 0 and len(disconnected) == 2:
-                    print(f"[INFO] Both players at {addr1} and {addr2} QUIT or disconnected during the game or ship placement.")
-                    for conn, addr in disconnected:
-                        try: conn.close()
-                        except Exception: pass
-                    print(f"[INFO] Two-player game between {addr1} and {addr2} ended due to both disconnecting.")
-                elif len(still_connected) == 2:
-                    print(f"[INFO] Both players at {addr1} and {addr2} are still connected (unexpected).")
-                else:
-                    for conn, addr in disconnected:
-                        print(f"[INFO] Player at {addr} QUIT or disconnected during the game or ship placement.")
-                        try: conn.close()
-                        except Exception: pass
-                    for conn, addr in still_connected:
-                        print(f"[INFO] Player at {addr} is still connected.")
-                    print(f"[INFO] Two-player game between {addr1} and {addr2} ended due to disconnect.")
-
-            game_running.clear()
-        except Exception as e:
-            print(f"[ERROR] Error in two-player game setup: {e}")
-
-def broadcast_chat(sender_username, message):
-    # Defensive: ensure message is str
-    if isinstance(message, bytes):
-        message = message.decode('utf-8', errors='ignore')
+    payload_len_val = None # Renamed to avoid conflict with outer scope 'length' if any
+    checksum_size = 4
     
-    print(f"[EVENT] Broadcasting chat message from {sender_username}: '{message}'")
-    print(f"[EVENT] Active connections count: {len(active_connections)}")
-    
-    packet = build_packet(0, PKT_TYPE_CHAT, f"{sender_username}: {message}".encode('utf-8'))
-    with active_connections_lock:
-        # Defensive: remove closed connections
-        to_remove = []
-        for idx, conn in enumerate(active_connections):
-            try:
-                fd = conn.fileno() if hasattr(conn, 'fileno') else 'unknown'
-                print(f"[EVENT] Sending chat to connection {idx} (fd={fd})")
-                conn.sendall(packet)
-            except Exception as e:
-                print(f"[EVENT] Failed to send chat to connection {idx}: {e}")
-                to_remove.append(conn)
+    buffer = b''
+
+    def read_bytes_interruptible(num_bytes):
+        nonlocal buffer
+        # Calculate how many bytes are needed from the socket
+        # to satisfy num_bytes, considering what's already in buffer.
+        # This interpretation was slightly off; num_bytes is what we want to *return*.
+        # So, we need to ensure buffer has at least num_bytes.
         
-        for conn in to_remove:
-            print(f"[EVENT] Removing dead connection from active_connections")
-            active_connections.remove(conn)
+        while len(buffer) < num_bytes:
+            if terminate_event and terminate_event.is_set():
+                raise ConnectionAbortedError("recv_packet terminated during read")
+            
+            # How much more to read from socket to potentially satisfy current request
+            needed_from_socket = num_bytes - len(buffer)
 
-def recv_packet_handle_chat(conn, username):
+            ready_to_read, _, _ = select.select([conn], [], [], 0.1) # 0.1s timeout
+            if not ready_to_read:
+                continue 
+
+            # Read only what's needed, or what's available up to a reasonable chunk size
+            # Max chunk to read to avoid overly large recv calls if num_bytes is huge.
+            # However, for this protocol, num_bytes (header, then payload, then checksum) are small.
+            chunk = conn.recv(needed_from_socket) 
+            if not chunk:
+                raise ConnectionError("Client disconnected")
+            buffer += chunk
+        
+        data_to_return = buffer[:num_bytes]
+        buffer = buffer[num_bytes:] 
+        return data_to_return
+
+    try:
+        header_content = read_bytes_interruptible(header_size)
+        seq, pkt_type, payload_len_val = struct.unpack("!IBH", header_content)
+        
+        payload_content = read_bytes_interruptible(payload_len_val)
+        checksum_content = read_bytes_interruptible(checksum_size)
+    except ConnectionAbortedError:
+        raise
+    except ConnectionError: 
+        raise
+    except Exception as e: 
+        print(f"[WARN] recv_packet low-level read error: {e}")
+        return None, None, None
+
+    full_packet_data = header_content + payload_content + checksum_content
+    try:
+        parsed_seq, parsed_pkt_type, parsed_payload = parse_packet(full_packet_data)
+        return parsed_seq, parsed_pkt_type, parsed_payload.decode('utf-8')
+    except ValueError as e: 
+        print(f"[WARN] recv_packet: parse_packet failed: {e}")
+        return None, None, None
+    except Exception as e:
+        print(f"[WARN] recv_packet: unexpected error during final parse: {e}")
+        return None, None, None
+
+def recv_packet_handle_chat(conn, username, terminate_event=None): # Added terminate_event
     """Receive a packet, handle chat packets inline, and return only game packets."""
     while True:
+        if terminate_event and terminate_event.is_set(): # Check event before blocking
+            raise ConnectionAbortedError(f"recv_packet_handle_chat terminated for {username}")
         try:
-            seq, pkt_type, payload = recv_packet(conn)
+            seq, pkt_type, payload = recv_packet(conn, terminate_event=terminate_event) # Pass event
+        except ConnectionAbortedError:
+            raise # Propagate if recv_packet was terminated
+        except ConnectionError as e: # Catch disconnects from recv_packet
+            print(f"[EVENT] ConnectionError in recv_packet_handle_chat for {username}: {e}")
+            raise # Re-raise to be handled by caller
         except Exception as e:
-            # Defensive: treat disconnect as fatal
-            print(f"[EVENT] Exception in recv_packet_handle_chat for {username}: {e}")
-            raise ConnectionError("Client disconnected")
+            print(f"[EVENT] Unexpected Exception in recv_packet_handle_chat's call to recv_packet for {username}: {e}")
+            raise ConnectionError(f"Client {username} disconnected or critical read error")
         
         if pkt_type == PKT_TYPE_CHAT:
             # Defensive: decode payload if it's bytes (for robustness)
@@ -558,14 +135,12 @@ def recv_packet_handle_chat(conn, username):
             if payload is not None and payload.strip() != "":
                 print(f"[EVENT] Received chat message from {username}: '{payload}'")
                 broadcast_chat(username, payload)
-            else:
-                print(f"[EVENT] Received empty chat message from {username}")
-            
-            continue  # Wait for next packet
+            # else: print(f"[EVENT] Received empty or None chat message from {username}")
+            continue
         
-        if pkt_type is None or payload is None:
-            print(f"[EVENT] Received invalid packet (type={pkt_type}, payload={payload}) from {username}")
-            raise ConnectionError("Client disconnected")
+        if pkt_type is None or payload is None: # Indicates parse_packet error
+            print(f"[EVENT] Received invalid packet (parse error: type={pkt_type}, payload={payload}) from {username}")
+            raise ConnectionError(f"Invalid packet from {username} (parse error)")
         
         return seq, pkt_type, payload
 
@@ -676,8 +251,11 @@ def two_player_game(conn1, addr1, conn2, addr2, username1, username2):
     winner_addr = None
     last_winner_addr = None
     game_key = tuple(sorted([username1, username2]))
+    
+    # Event to signal the game_thread (running battleship.py logic) to terminate
+    this_game_terminate_event = threading.Event()
+
     try:
-        # --- NEW: Mark both players as connected in game state ---
         game_state = games.get(game_key)
         if not game_state:
             board1 = Board(BOARD_SIZE)
@@ -686,80 +264,69 @@ def two_player_game(conn1, addr1, conn2, addr2, username1, username2):
             placed1 = False
             placed2 = False
             games[game_key] = {
-                'board1': board1,
-                'board2': board2,
-                'turn': turn,
-                'placed1': placed1,
-                'placed2': placed2,
+                'board1': board1, 'board2': board2, 'turn': turn,
+                'placed1': placed1, 'placed2': placed2,
                 'connected': {username1: True, username2: True},
                 'conns': {username1: conn1, username2: conn2},
                 'addrs': {username1: addr1, username2: addr2},
-                'waiting_reconnect': False,
-                'last_disconnect_time': None
+                'waiting_reconnect': False, 'last_disconnect_time': None,
+                'terminate_event': this_game_terminate_event # Store this game's terminate event
             }
         else:
+            # Game state exists, this is likely a reconnect scenario.
+            # The old game_thread should have been signaled by game_manager.
             board1 = game_state['board1']
             board2 = game_state['board2']
             turn = game_state['turn']
             placed1 = game_state.get('placed1', False)
             placed2 = game_state.get('placed2', False)
+            
             game_state['connected'][username1] = True
-            game_state['connected'][username2] = True
+            game_state['connected'][username2] = True # Assume both are now connected
             game_state['conns'][username1] = conn1
             game_state['conns'][username2] = conn2
             game_state['addrs'][username1] = addr1
             game_state['addrs'][username2] = addr2
             game_state['waiting_reconnect'] = False
             game_state['last_disconnect_time'] = None
+            game_state['terminate_event'] = this_game_terminate_event # This new instance controls termination
 
-        seq_send1 = 0
-        seq_recv1 = 0
-        seq_send2 = 0
-        seq_recv2 = 0
+        seq_send1, seq_recv1, seq_send2, seq_recv2 = 0, 0, 0, 0
 
-        def send1(msg):
-            nonlocal seq_send1
-            send_packet(conn1, seq_send1, PKT_TYPE_GAME, msg)
-            seq_send1 += 1
+        def send1(msg): nonlocal seq_send1; send_packet(conn1, seq_send1, PKT_TYPE_GAME, msg); seq_send1 += 1
+        def send2(msg): nonlocal seq_send2; send_packet(conn2, seq_send2, PKT_TYPE_GAME, msg); seq_send2 += 1
 
-        def send2(msg):
-            nonlocal seq_send2
-            send_packet(conn2, seq_send2, PKT_TYPE_GAME, msg)
-            seq_send2 += 1
-
-        def recv1():
+        # Modified recv1 and recv2 to accept and pass the terminate_event
+        def recv1(event_to_check):
             nonlocal seq_recv1
-            s, pkt_type, payload = recv_packet_handle_chat(conn1, username1)
+            s, pkt_type, payload = recv_packet_handle_chat(conn1, username1, terminate_event=event_to_check)
             seq_recv1 = s
             return payload
 
-        def recv2():
+        def recv2(event_to_check):
             nonlocal seq_recv2
-            s, pkt_type, payload = recv_packet_handle_chat(conn2, username2)
+            s, pkt_type, payload = recv_packet_handle_chat(conn2, username2, terminate_event=event_to_check)
             seq_recv2 = s
             return payload
 
+        # RFileWrappers now take the terminate_event
         class WFileWrapper1:
-            def write(self, msg):
-                send1(msg)
-            def flush(self):
-                pass
+            def write(self, msg): send1(msg)
+            def flush(self): pass
 
         class WFileWrapper2:
-            def write(self, msg):
-                send2(msg)
-            def flush(self):
-                pass
+            def write(self, msg): send2(msg)
+            def flush(self): pass
 
         class RFileWrapper1:
-            def readline(self):
-                return recv1()
+            def __init__(self, terminate_event): self.terminate_event = terminate_event
+            def readline(self): return recv1(self.terminate_event)
 
         class RFileWrapper2:
-            def readline(self):
-                return recv2()
+            def __init__(self, terminate_event): self.terminate_event = terminate_event
+            def readline(self): return recv2(self.terminate_event)
 
-        print(f"[EVENT] Starting two player game for {addr1} and {addr2}")
+        print(f"[EVENT] Starting two player game for {addr1} ({username1}) and {addr2} ({username2})")
         instruction = (
             "INSTRUCTION: To place a ship, type: place <start_coord> <orientation> <ship_name>\n"
             "Example: place b6 v carrier\n"
@@ -779,7 +346,7 @@ def two_player_game(conn1, addr1, conn2, addr2, username1, username2):
             player_sessions[username1]['in_game'] = True
             player_sessions[username2]['in_game'] = True
         game_running.set()
-
+        
         # --- Game state restoration logic ---
         game_state = games.get(game_key)
         if not game_state:
@@ -804,209 +371,176 @@ def two_player_game(conn1, addr1, conn2, addr2, username1, username2):
             placed2 = game_state.get('placed2', False)
 
         # Pass state to battleship logic
-        def save_state_hook(board1, board2, turn, placed1, placed2):
-            games[game_key]['board1'] = board1
-            games[game_key]['board2'] = board2
-            games[game_key]['turn'] = turn
-            games[game_key]['placed1'] = placed1
-            games[game_key]['placed2'] = placed2
+        def save_state_hook(b1, b2, t, p1, p2):
+            gs = games.get(game_key)
+            if gs: # Basic check
+                gs.update({'board1': b1, 'board2': b2, 'turn': t, 'placed1': p1, 'placed2': p2})
 
-        # --- NEW: Wrap run_two_player_game_online to handle disconnects and reconnections ---
-        def player_disconnected_callback(username):
-            game_state = games.get(game_key)
-            if game_state:
-                game_state['connected'][username] = False
-                # --- Set waiting_reconnect immediately on disconnect ---
-                game_state['waiting_reconnect'] = True
-                game_state['last_disconnect_time'] = time.time()
 
-        def send_info_to_players(disconnected, connected, game_state):
-            try:
-                if disconnected and connected:
-                    loser = disconnected[0]
-                    winner = connected[0]
-                    loser_conn = game_state['conns'][loser]
-                    winner_conn = game_state['conns'][winner]
-                    winner_conn.sendall(build_packet(0, PKT_TYPE_GAME, b"INFO: Opponent disconnected. Waiting up to 60 seconds for them to reconnect..."))
-                    try:
-                        loser_conn.sendall(build_packet(0, PKT_TYPE_GAME, b"INFO: You have been disconnected. If you reconnect within 60 seconds, you can resume the game."))
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+        def player_disconnected_callback(username_dc):
+            gs = games.get(game_key)
+            if gs:
+                if gs['connected'].get(username_dc, False): # Check if actually connected before marking
+                    print(f"[CALLBACK] Player {username_dc} disconnected from game {game_key}.")
+                    gs['connected'][username_dc] = False
+                    gs['waiting_reconnect'] = True
+                    gs['last_disconnect_time'] = time.time()
+                    # Inform other player (simplified)
+                    other_user = username2 if username_dc == username1 else username1
+                    other_conn = conn2 if username_dc == username1 else conn1
+                    if gs['connected'].get(other_user):
+                        try:
+                            send_packet(other_conn, 0, PKT_TYPE_GAME, "INFO: Opponent disconnected. Waiting for reconnect...")
+                        except Exception as e:
+                            print(f"[WARN] Failed to inform {other_user} of disconnect: {e}")
+                # else:
+                #    print(f"[CALLBACK] Player {username_dc} already marked disconnected or not in game {game_key}.")
 
-        # --- NEW: Use a dedicated function to run the game logic ---
+
         def run_game():
-            run_two_player_game_online(
-                RFileWrapper1(), WFileWrapper1(),
-                RFileWrapper2(), WFileWrapper2(),
-                lobby_broadcast=lobby_broadcast,
-                usernames=(username1, username2),
-                board1=board1,
-                board2=board2,
-                turn=turn,
-                placed1=placed1,
-                placed2=placed2,
-                save_state_hook=save_state_hook,
-                player_disconnected_callback=player_disconnected_callback
-            )
-
-        game_thread = threading.Thread(target=run_game)
+            try:
+                run_two_player_game_online(
+                    RFileWrapper1(this_game_terminate_event), WFileWrapper1(),
+                    RFileWrapper2(this_game_terminate_event), WFileWrapper2(),
+                    lobby_broadcast=lobby_broadcast,
+                    usernames=(username1, username2),
+                    board1=board1, board2=board2, turn=turn,
+                    placed1=placed1, placed2=placed2,
+                    save_state_hook=save_state_hook,
+                    player_disconnected_callback=player_disconnected_callback
+                )
+            except ConnectionAbortedError: # Expected when this_game_terminate_event is set
+                print(f"[INFO] Game logic for {game_key} aborted by terminate signal.")
+            except ConnectionError as e:
+                print(f"[INFO] Game logic for {game_key} ended due to connection error: {e}")
+                # player_disconnected_callback should have been called by battleship.py's ConnectionError handling
+            except Exception as e:
+                print(f"[ERROR] run_game for {game_key} crashed: {e}")
+            finally:
+                print(f"[INFO] run_game_worker (battleship.py logic) for {game_key} finished.")
+        
+        game_thread = threading.Thread(target=run_game, daemon=True)
         game_thread.start()
 
-        # --- Monitor disconnects while the game is running ---
-        game_state = games.get(game_key)
+        # Main monitoring loop for this two_player_game instance
         disconnect_timeout_started = False
         disconnect_start_time = None
-        disconnected_user = None
-        connected_user = None
+        disconnected_user_monitor = None # Renamed to avoid clash with callback's var
 
         while True:
             if not game_thread.is_alive():
-                break
-            if game_state:
-                disconnected = [u for u, c in game_state['connected'].items() if not c]
-                connected = [u for u, c in game_state['connected'].items() if c]
-                # Start timeout as soon as one player disconnects
-                if not disconnect_timeout_started and len(disconnected) == 1 and len(connected) == 1:
-                    disconnect_timeout_started = True
-                    disconnect_start_time = time.time()
-                    disconnected_user = disconnected[0]
-                    connected_user = connected[0]
-                    print(f"[INFO] Waiting 60s for {disconnected_user} to reconnect...")
-                    send_info_to_players([disconnected_user], [connected_user], game_state)
-                # If timeout started, check for reconnect or timeout expiry
+                print(f"[INFO] Game thread for {game_key} finished. Exiting supervisor loop.")
+                break # Game ended normally or crashed, cleanup in finally
+
+            current_gs_monitor = games.get(game_key)
+            if not current_gs_monitor or current_gs_monitor.get('terminate_event') != this_game_terminate_event:
+                # This instance is no longer the active supervisor for game_key (e.g., superseded by a reconnect)
+                print(f"[INFO] Supervisor for {game_key} (instance with event {this_game_terminate_event}) superseded. Signaling its own game_thread to terminate.")
+                this_game_terminate_event.set() # Signal its own game_thread
+                game_thread.join(timeout=2.0)
+                break # Exit this supervisor's loop
+
+            if current_gs_monitor.get('waiting_reconnect'):
+                if not disconnect_timeout_started:
+                    # Find who is disconnected
+                    temp_disconnected_user = None
+                    for u, c_stat in current_gs_monitor['connected'].items():
+                        if not c_stat: temp_disconnected_user = u; break
+                    
+                    if temp_disconnected_user:
+                        disconnected_user_monitor = temp_disconnected_user
+                        disconnect_timeout_started = True
+                        disconnect_start_time = current_gs_monitor.get('last_disconnect_time', time.time())
+                        print(f"[INFO] Supervisor for {game_key}: Detected {disconnected_user_monitor} disconnected. Timeout started.")
+                    else: # Should not happen if waiting_reconnect is true
+                        current_gs_monitor['waiting_reconnect'] = False # Reset
+
                 if disconnect_timeout_started:
-                    # If both disconnected, break immediately
-                    if len(connected) == 0 and len(disconnected) == 2:
-                        print(f"[INFO] Both players at {addr1} and {addr2} QUIT or disconnected during the game or ship placement.")
-                        break
-                    # If reconnected, resume game
-                    if all(game_state['connected'].values()):
-                        print(f"[INFO] {', '.join(game_state['connected'].keys())} reconnected for game {game_key}.")
-                        print(f"[INFO] Both players reconnected for game {game_key}.")
+                    if all(current_gs_monitor['connected'].values()): # Player reconnected
+                        print(f"[INFO] Supervisor for {game_key}: Player {disconnected_user_monitor} reconnected. Game_manager will handle new supervisor.")
+                        # This supervisor instance will be superseded. The check for 'terminate_event' inequality will catch it.
                         disconnect_timeout_started = False
-                        disconnect_start_time = None
-                        disconnected_user = None
-                        connected_user = None
-                    # If timeout expired, forfeit
+                        # No need to break here; the event inequality check will handle it.
                     elif time.time() - disconnect_start_time >= RECONNECT_TIMEOUT:
-                        print(f"[INFO] {disconnected_user} did not reconnect in time. {connected_user} wins by forfeit.")
-                        try:
-                            winner_conn = game_state['conns'][connected_user]
-                            winner_addr = game_state['addrs'][connected_user]
-                            winner_username = connected_user
-                            winner_conn.sendall(build_packet(0, PKT_TYPE_GAME, b"OPPONENT_TIMEOUT. You win!"))
-                        except Exception:
-                            winner_conn = None
-                            winner_addr = None
-                            winner_username = None
-                        # End the game and requeue the winner for next match
-                        game_state['waiting_reconnect'] = False
-                        del games[game_key]
-                        if winner_conn and winner_conn.fileno() != -1:
-                            with waiting_players_lock:
-                                if (winner_conn, winner_addr, winner_username) not in waiting_lines:
-                                    waiting_lines.insert(0, (winner_conn, winner_addr, winner_username))
-                        # --- Immediately break so lobby_manager can match the winner ---
-                        break
-            time.sleep(0.5)
-
-        # --- Cleanup and lobby requeue logic ---
-    except Exception as e:
-        print(f"[ERROR] Exception during game: {e}")
-        # --- Remove immediate win/forfeit logic here ---
-        print(f"[INFO] Notified remaining player(s) of win and returning to lobby.")
-    finally:
-        with player_sessions_lock:
-            player_sessions[username1]['in_game'] = False
-            player_sessions[username2]['in_game'] = False
-        try:
-            # Remove both players from waiting_lines to prevent infinite rematch loop
-            with waiting_players_lock:
-                waiting_lines[:] = [item for item in waiting_lines if item[0] not in (conn1, conn2)]
-            # Only check for disconnects if the game did NOT end normally
-            both_alive = (conn1.fileno() != -1 and conn2.fileno() != -1)
-            # Extra check: try to send a ping to both players to confirm they are really alive
-            if both_alive:
-                try:
-                    conn1.send(b"PING\n")
-                    conn2.send(b"PING\n")
-                except Exception:
-                    both_alive = False
-            if both_alive:
-                print(f"[INFO] Both players at {addr1} and {addr2} are still connected, game ended normally.")
-                with waiting_players_lock:
-                    # FIX: Always append (conn, addr, username)
-                    waiting_lines.insert(0, (conn1, addr1, username1))
-                    waiting_lines.append((conn2, addr2, username2))
-                print(f"[INFO] Two-player game between {addr1} and {addr2} ended. Players returned to lobby if still connected.")
-            else:
-                # Improved: check fileno and try to send/recv to determine who is really disconnected
-                still_connected = []
-                disconnected = []
-                for conn, addr in [(conn1, addr1), (conn2, addr2)]:
-                    alive = False
-                    if conn.fileno() != -1:
-                        try:
-                            conn.setblocking(False)
+                        connected_user_monitor = None
+                        for u, c_stat in current_gs_monitor['connected'].items():
+                            if c_stat: connected_user_monitor = u; break
+                        
+                        print(f"[INFO] Supervisor for {game_key}: {disconnected_user_monitor} did not reconnect. {connected_user_monitor or 'Opponent'} wins by forfeit.")
+                        if connected_user_monitor:
                             try:
-                                conn.send(b"PING\n")
-                                alive = True
-                            except Exception:
-                                try:
-                                    data = conn.recv(1, socket.MSG_PEEK)
-                                    if data:
-                                        alive = True
-                                except Exception:
-                                    alive = False
-                        finally:
-                            try: conn.setblocking(True)
+                                other_conn = current_gs_monitor['conns'][connected_user_monitor]
+                                send_packet(other_conn, 0, PKT_TYPE_GAME, "OPPONENT_TIMEOUT. You win!")
                             except Exception: pass
-                    if alive:
-                        still_connected.append((conn, addr))
-                    else:
-                        disconnected.append((conn, addr))
+                        
+                        this_game_terminate_event.set() # Signal game_thread to stop
+                        game_thread.join(timeout=2.0)
+                        # Mark for deletion in finally block by this active supervisor
+                        current_gs_monitor['game_over_by_forfeit'] = True 
+                        break # Exit supervisor loop to finally block
+            else: # Not waiting_reconnect
+                disconnect_timeout_started = False
+            
+            time.sleep(0.5)
+        # End of supervisor's main while loop
 
-                # FIX: When requeueing winner, include username
-                if len(still_connected) == 1 and len(disconnected) == 1:
-                    winner_conn, winner_addr = still_connected[0]
-                    quitter_conn, quitter_addr = disconnected[0]
-                    # Find winner's username
-                    winner_username = None
-                    if (winner_conn, winner_addr) == (conn1, addr1):
-                        winner_username = username1
-                    elif (winner_conn, winner_addr) == (conn2, addr2):
-                        winner_username = username2
-                    print(f"[INFO] Player at {winner_addr} WON (opponent timeout/disconnect, waiting for next match or Ctrl+C to exit).")
-                    print(f"[INFO] Player at {quitter_addr} QUIT or disconnected during the game or ship placement.")
-                    # --- FIX: Requeue the winner for next match ---
-                    with waiting_players_lock:
-                        if (winner_conn, winner_addr, winner_username) not in waiting_lines and winner_conn.fileno() != -1:
-                            waiting_lines.insert(0, (winner_conn, winner_addr, winner_username))
-                    try: quitter_conn.close()
-                    except Exception: pass
-                    print(f"[INFO] Two-player game between {addr1} and {addr2} ended due to disconnect/timeout.")
-                elif len(still_connected) == 0 and len(disconnected) == 2:
-                    print(f"[INFO] Both players at {addr1} and {addr2} QUIT or disconnected during the game or ship placement.")
-                    for conn, addr in disconnected:
-                        try: conn.close()
-                        except Exception: pass
-                    print(f"[INFO] Two-player game between {addr1} and {addr2} ended due to both disconnecting.")
-                elif len(still_connected) == 2:
-                    print(f"[INFO] Both players at {addr1} and {addr2} are still connected (unexpected).")
-                else:
-                    for conn, addr in disconnected:
-                        print(f"[INFO] Player at {addr} QUIT or disconnected during the game or ship placement.")
-                        try: conn.close()
-                        except Exception: pass
-                    for conn, addr in still_connected:
-                        print(f"[INFO] Player at {addr} is still connected.")
-                    print(f"[INFO] Two-player game between {addr1} and {addr2} ended due to disconnect.")
+    except Exception as e:
+        print(f"[ERROR] Outer exception in two_player_game for {game_key}: {e}")
+        if games.get(game_key, {}).get('terminate_event') == this_game_terminate_event:
+            this_game_terminate_event.set() # Try to stop its game_thread
+    finally:
+        print(f"[INFO] two_player_game instance for {game_key} (event {this_game_terminate_event}) entering finally.")
+        
+        final_gs_check = games.get(game_key)
+        is_still_active_supervisor = final_gs_check and final_gs_check.get('terminate_event') == this_game_terminate_event
 
+        game_ended_by_this_supervisor = False
+        if is_still_active_supervisor:
+            if not game_thread.is_alive() or final_gs_check.get('game_over_by_forfeit'):
+                game_ended_by_this_supervisor = True
+        
+        if game_ended_by_this_supervisor:
+            print(f"[INFO] Active supervisor for {game_key} (event {this_game_terminate_event}) cleaning up.")
+            # Re-queue logic (simplified, ensure players are valid)
+            players_to_requeue = []
+            was_forfeit = final_gs_check.get('game_over_by_forfeit', False)
+
+            if was_forfeit:
+                for p_user in [username1, username2]:
+                    if final_gs_check['connected'].get(p_user): # Winner by forfeit
+                        p_conn = final_gs_check['conns'].get(p_user)
+                        p_addr = final_gs_check['addrs'].get(p_user)
+                        if p_conn and p_conn.fileno() != -1: players_to_requeue.append((p_conn, p_addr, p_user))
+            else: # Normal end
+                for p_user in [username1, username2]:
+                    # Check current connections from this supervisor's perspective
+                    p_conn = conn1 if p_user == username1 else conn2
+                    p_addr = addr1 if p_user == username1 else addr2
+                    # A player might have disconnected just as game ended, so check fileno
+                    if p_conn and p_conn.fileno() != -1:
+                         players_to_requeue.append((p_conn, p_addr, p_user))
+            
+            with waiting_players_lock:
+                waiting_lines[:] = [item for item in waiting_lines if item[2] not in (username1, username2)]
+                for p_conn, p_addr, p_user in players_to_requeue:
+                     if not any(wl_item[2] == p_user for wl_item in waiting_lines):
+                        waiting_lines.append((p_conn, p_addr, p_user))
+                        print(f"[INFO] Re-queued {p_user} by supervisor for {game_key}.")
+            
+            if game_key in games and games[game_key].get('terminate_event') == this_game_terminate_event:
+                del games[game_key]
+                print(f"[INFO] Game state for {game_key} deleted by its active supervisor.")
+            
+            with player_sessions_lock:
+                if player_sessions.get(username1): player_sessions[username1]['in_game'] = False
+                if player_sessions.get(username2): player_sessions[username2]['in_game'] = False
             game_running.clear()
-        except Exception as e:
-            print(f"[ERROR] Error in two-player game setup: {e}")
+        else:
+            print(f"[INFO] Superseded/Inactive supervisor for {game_key} (event {this_game_terminate_event}) minimal cleanup.")
+            if not this_game_terminate_event.is_set(): this_game_terminate_event.set()
+            if game_thread.is_alive(): game_thread.join(timeout=1.0)
+        
+        print(f"[INFO] two_player_game instance for {game_key} (event {this_game_terminate_event}) finished execution.")
 
 def broadcast_chat(sender_username, message):
     # Defensive: ensure message is str
@@ -1032,15 +566,21 @@ def broadcast_chat(sender_username, message):
             print(f"[EVENT] Removing dead connection from active_connections")
             active_connections.remove(conn)
 
-def recv_packet_handle_chat(conn, username):
+def recv_packet_handle_chat(conn, username, terminate_event=None): # Added terminate_event
     """Receive a packet, handle chat packets inline, and return only game packets."""
     while True:
+        if terminate_event and terminate_event.is_set(): # Check event before blocking
+            raise ConnectionAbortedError(f"recv_packet_handle_chat terminated for {username}")
         try:
-            seq, pkt_type, payload = recv_packet(conn)
+            seq, pkt_type, payload = recv_packet(conn, terminate_event=terminate_event) # Pass event
+        except ConnectionAbortedError:
+            raise # Propagate if recv_packet was terminated
+        except ConnectionError as e: # Catch disconnects from recv_packet
+            print(f"[EVENT] ConnectionError in recv_packet_handle_chat for {username}: {e}")
+            raise # Re-raise to be handled by caller
         except Exception as e:
-            # Defensive: treat disconnect as fatal
-            print(f"[EVENT] Exception in recv_packet_handle_chat for {username}: {e}")
-            raise ConnectionError("Client disconnected")
+            print(f"[EVENT] Unexpected Exception in recv_packet_handle_chat's call to recv_packet for {username}: {e}")
+            raise ConnectionError(f"Client {username} disconnected or critical read error")
         
         if pkt_type == PKT_TYPE_CHAT:
             # Defensive: decode payload if it's bytes (for robustness)
@@ -1050,19 +590,472 @@ def recv_packet_handle_chat(conn, username):
             if payload is not None and payload.strip() != "":
                 print(f"[EVENT] Received chat message from {username}: '{payload}'")
                 broadcast_chat(username, payload)
-            else:
-                print(f"[EVENT] Received empty chat message from {username}")
-            
-            continue  # Wait for next packet
+            # else: print(f"[EVENT] Received empty or None chat message from {username}")
+            continue
         
-        if pkt_type is None or payload is None:
-            print(f"[EVENT] Received invalid packet (type={pkt_type}, payload={payload}) from {username}")
-            raise ConnectionError("Client disconnected")
+        if pkt_type is None or payload is None: # Indicates parse_packet error
+            print(f"[EVENT] Received invalid packet (parse error: type={pkt_type}, payload={payload}) from {username}")
+            raise ConnectionError(f"Invalid packet from {username} (parse error)")
+        
+        return seq, pkt_type, payload
+
+def handle_initial_connection(conn, addr):
+    """
+    Handles the initial handshake to get the username.
+    Returns (username, conn, addr) or (None, None, None) on failure.
+    """
+    try:
+        seq = 0
+        seq_recv = 0
+        # Receive USERNAME packet
+        seq_recv, pkt_type, payload = recv_packet(conn)
+        if pkt_type != PKT_TYPE_GAME or not payload.startswith("USERNAME "):
+            send_packet(conn, seq, PKT_TYPE_GAME, "ERROR: Must provide USERNAME <name> as first message.")
+            conn.close()
+            return None, None, None
+        username = payload.strip().split(" ", 1)[1]
+        if not username:
+            send_packet(conn, seq, PKT_TYPE_GAME, "ERROR: Username cannot be empty.")
+            conn.close()
+            return None, None, None
+        print(f"[EVENT] Received username: {username} from {addr}")
+        # --- Send a protocol welcome/lobby message immediately after handshake ---
+        send_packet(conn, seq+1, PKT_TYPE_GAME, "WELCOME! Waiting for game to start...")
+        return username, conn, addr
+    except Exception as e:
+        print(f"[EVENT] Exception in handle_initial_connection: {e}")
+        try: conn.close()
+        except: pass
+        return None, None, None
+
+def wait_for_reconnect(username, old_session, mode):
+    """
+    Waits up to RECONNECT_TIMEOUT seconds for the player to reconnect.
+    Returns new (conn, addr) if reconnected, else None.
+    """
+    start_time = time.time()
+    while time.time() - start_time < RECONNECT_TIMEOUT:
+        with player_sessions_lock:
+            session = player_sessions.get(username)
+            if session and session.get('reconnected'):
+                # Got a new connection
+                conn = session['conn']
+                addr = session['addr']
+                session['reconnected'] = False  # Reset for future disconnects
+                return conn, addr
+        time.sleep(0.5)
+    return None, None
+
+def single_player(conn, addr, username):
+    try:
+        seq_send = 0
+        seq_recv = 0
+        print(f"[EVENT] Starting single player game for {addr}")
+
+        def send(msg):
+            nonlocal seq_send
+            send_packet(conn, seq_send, PKT_TYPE_GAME, msg)
+            seq_send += 1
+
+        def recv():
+            nonlocal seq_recv
+            s, pkt_type, payload = recv_packet_handle_chat(conn, username)
+            seq_recv = s
+            return payload
+
+        # Add instruction for ship placement
+        instruction = (
+            "INSTRUCTION: To place a ship, type: place <start_coord> <orientation> <ship_name>\n"
+            "Example: place b6 v carrier\n"
+        )
+        send(instruction)
+
+        class WFileWrapper:
+            def write(self, msg):
+                send(msg)
+            def flush(self):
+                pass
+
+        class RFileWrapper:
+            def readline(self):
+                return recv()
+
+        run_single_player_game_online(RFileWrapper(), WFileWrapper())
+        print(f"[EVENT] Finished single player game for {addr}")
+    except Exception as e:
+        print(f"[WARN] Single player client {addr} ({username}) disconnected: {e}")
+        # Wait for reconnection
+        with player_sessions_lock:
+            player_sessions[username]['disconnected'] = True
+        print(f"[INFO] Waiting {RECONNECT_TIMEOUT}s for {username} to reconnect...")
+        new_conn, new_addr = wait_for_reconnect(username, player_sessions[username], mode="1")
+        if new_conn:
+            print(f"[INFO] {username} reconnected from {new_addr}. Resuming game.")
+            # TODO: Restore game state if needed (for single player, may need to persist board)
+            # For now, just restart a new game
+            single_player(new_conn, new_addr, username)
+        else:
+            print(f"[INFO] {username} did not reconnect in time. Forfeiting game.")
+    finally:
+        conn.close()
+        print(f"[INFO] Single player client {addr} ({username}) connection closed.")
+
+def two_player_game(conn1, addr1, conn2, addr2, username1, username2):
+    global game_running
+    winner_conn = None
+    winner_addr = None
+    last_winner_addr = None
+    game_key = tuple(sorted([username1, username2]))
+    
+    # Event to signal the game_thread (running battleship.py logic) to terminate
+    this_game_terminate_event = threading.Event()
+
+    try:
+        game_state = games.get(game_key)
+        if not game_state:
+            board1 = Board(BOARD_SIZE)
+            board2 = Board(BOARD_SIZE)
+            turn = 0
+            placed1 = False
+            placed2 = False
+            games[game_key] = {
+                'board1': board1, 'board2': board2, 'turn': turn,
+                'placed1': placed1, 'placed2': placed2,
+                'connected': {username1: True, username2: True},
+                'conns': {username1: conn1, username2: conn2},
+                'addrs': {username1: addr1, username2: addr2},
+                'waiting_reconnect': False, 'last_disconnect_time': None,
+                'terminate_event': this_game_terminate_event # Store this game's terminate event
+            }
+        else:
+            # Game state exists, this is likely a reconnect scenario.
+            # The old game_thread should have been signaled by game_manager.
+            board1 = game_state['board1']
+            board2 = game_state['board2']
+            turn = game_state['turn']
+            placed1 = game_state.get('placed1', False)
+            placed2 = game_state.get('placed2', False)
+            
+            game_state['connected'][username1] = True
+            game_state['connected'][username2] = True # Assume both are now connected
+            game_state['conns'][username1] = conn1
+            game_state['conns'][username2] = conn2
+            game_state['addrs'][username1] = addr1
+            game_state['addrs'][username2] = addr2
+            game_state['waiting_reconnect'] = False
+            game_state['last_disconnect_time'] = None
+            game_state['terminate_event'] = this_game_terminate_event # This new instance controls termination
+
+        seq_send1, seq_recv1, seq_send2, seq_recv2 = 0, 0, 0, 0
+
+        def send1(msg): nonlocal seq_send1; send_packet(conn1, seq_send1, PKT_TYPE_GAME, msg); seq_send1 += 1
+        def send2(msg): nonlocal seq_send2; send_packet(conn2, seq_send2, PKT_TYPE_GAME, msg); seq_send2 += 1
+
+        # Modified recv1 and recv2 to accept and pass the terminate_event
+        def recv1(event_to_check):
+            nonlocal seq_recv1
+            s, pkt_type, payload = recv_packet_handle_chat(conn1, username1, terminate_event=event_to_check)
+            seq_recv1 = s
+            return payload
+
+        def recv2(event_to_check):
+            nonlocal seq_recv2
+            s, pkt_type, payload = recv_packet_handle_chat(conn2, username2, terminate_event=event_to_check)
+            seq_recv2 = s
+            return payload
+
+        # RFileWrappers now take the terminate_event
+        class WFileWrapper1:
+            def write(self, msg): send1(msg)
+            def flush(self): pass
+
+        class WFileWrapper2:
+            def write(self, msg): send2(msg)
+            def flush(self): pass
+
+        class RFileWrapper1:
+            def __init__(self, terminate_event): self.terminate_event = terminate_event
+            def readline(self): return recv1(self.terminate_event)
+
+        class RFileWrapper2:
+            def __init__(self, terminate_event): self.terminate_event = terminate_event
+            def readline(self): return recv2(self.terminate_event)
+
+        print(f"[EVENT] Starting two player game for {addr1} ({username1}) and {addr2} ({username2})")
+        instruction = (
+            "INSTRUCTION: To place a ship, type: place <start_coord> <orientation> <ship_name>\n"
+            "Example: place b6 v carrier\n"
+        )
+        send1(instruction)
+        send2(instruction)
+        def lobby_broadcast(msg):
+            with waiting_players_lock:
+                for c, a, u in waiting_lines:
+                    try:
+                        lobby_wfile = c.makefile('w')
+                        lobby_wfile.write(msg + "\n")
+                        lobby_wfile.flush()
+                    except Exception:
+                        pass
+        with player_sessions_lock:
+            player_sessions[username1]['in_game'] = True
+            player_sessions[username2]['in_game'] = True
+        game_running.set()
+        
+        # --- Game state restoration logic ---
+        game_state = games.get(game_key)
+        if not game_state:
+            # New game state
+            board1 = Board(BOARD_SIZE)
+            board2 = Board(BOARD_SIZE)
+            turn = 0
+            placed1 = False
+            placed2 = False
+            games[game_key] = {
+                'board1': board1,
+                'board2': board2,
+                'turn': turn,
+                'placed1': placed1,
+                'placed2': placed2
+            }
+        else:
+            board1 = game_state['board1']
+            board2 = game_state['board2']
+            turn = game_state['turn']
+            placed1 = game_state.get('placed1', False)
+            placed2 = game_state.get('placed2', False)
+
+        # Pass state to battleship logic
+        def save_state_hook(b1, b2, t, p1, p2):
+            gs = games.get(game_key)
+            if gs: # Basic check
+                gs.update({'board1': b1, 'board2': b2, 'turn': t, 'placed1': p1, 'placed2': p2})
+
+
+        def player_disconnected_callback(username_dc):
+            gs = games.get(game_key)
+            if gs:
+                if gs['connected'].get(username_dc, False): # Check if actually connected before marking
+                    print(f"[CALLBACK] Player {username_dc} disconnected from game {game_key}.")
+                    gs['connected'][username_dc] = False
+                    gs['waiting_reconnect'] = True
+                    gs['last_disconnect_time'] = time.time()
+                    # Inform other player (simplified)
+                    other_user = username2 if username_dc == username1 else username1
+                    other_conn = conn2 if username_dc == username1 else conn1
+                    if gs['connected'].get(other_user):
+                        try:
+                            send_packet(other_conn, 0, PKT_TYPE_GAME, "INFO: Opponent disconnected. Waiting for reconnect...")
+                        except Exception as e:
+                            print(f"[WARN] Failed to inform {other_user} of disconnect: {e}")
+                # else:
+                #    print(f"[CALLBACK] Player {username_dc} already marked disconnected or not in game {game_key}.")
+
+
+        def run_game():
+            try:
+                run_two_player_game_online(
+                    RFileWrapper1(this_game_terminate_event), WFileWrapper1(),
+                    RFileWrapper2(this_game_terminate_event), WFileWrapper2(),
+                    lobby_broadcast=lobby_broadcast,
+                    usernames=(username1, username2),
+                    board1=board1, board2=board2, turn=turn,
+                    placed1=placed1, placed2=placed2,
+                    save_state_hook=save_state_hook,
+                    player_disconnected_callback=player_disconnected_callback
+                )
+            except ConnectionAbortedError: # Expected when this_game_terminate_event is set
+                print(f"[INFO] Game logic for {game_key} aborted by terminate signal.")
+            except ConnectionError as e:
+                print(f"[INFO] Game logic for {game_key} ended due to connection error: {e}")
+                # player_disconnected_callback should have been called by battleship.py's ConnectionError handling
+            except Exception as e:
+                print(f"[ERROR] run_game for {game_key} crashed: {e}")
+            finally:
+                print(f"[INFO] run_game_worker (battleship.py logic) for {game_key} finished.")
+        
+        game_thread = threading.Thread(target=run_game, daemon=True)
+        game_thread.start()
+
+        # Main monitoring loop for this two_player_game instance
+        disconnect_timeout_started = False
+        disconnect_start_time = None
+        disconnected_user_monitor = None # Renamed to avoid clash with callback's var
+
+        while True:
+            if not game_thread.is_alive():
+                print(f"[INFO] Game thread for {game_key} finished. Exiting supervisor loop.")
+                break # Game ended normally or crashed, cleanup in finally
+
+            current_gs_monitor = games.get(game_key)
+            if not current_gs_monitor or current_gs_monitor.get('terminate_event') != this_game_terminate_event:
+                # This instance is no longer the active supervisor for game_key (e.g., superseded by a reconnect)
+                print(f"[INFO] Supervisor for {game_key} (instance with event {this_game_terminate_event}) superseded. Signaling its own game_thread to terminate.")
+                this_game_terminate_event.set() # Signal its own game_thread
+                game_thread.join(timeout=2.0)
+                break # Exit this supervisor's loop
+
+            if current_gs_monitor.get('waiting_reconnect'):
+                if not disconnect_timeout_started:
+                    # Find who is disconnected
+                    temp_disconnected_user = None
+                    for u, c_stat in current_gs_monitor['connected'].items():
+                        if not c_stat: temp_disconnected_user = u; break
+                    
+                    if temp_disconnected_user:
+                        disconnected_user_monitor = temp_disconnected_user
+                        disconnect_timeout_started = True
+                        disconnect_start_time = current_gs_monitor.get('last_disconnect_time', time.time())
+                        print(f"[INFO] Supervisor for {game_key}: Detected {disconnected_user_monitor} disconnected. Timeout started.")
+                    else: # Should not happen if waiting_reconnect is true
+                        current_gs_monitor['waiting_reconnect'] = False # Reset
+
+                if disconnect_timeout_started:
+                    if all(current_gs_monitor['connected'].values()): # Player reconnected
+                        print(f"[INFO] Supervisor for {game_key}: Player {disconnected_user_monitor} reconnected. Game_manager will handle new supervisor.")
+                        # This supervisor instance will be superseded. The check for 'terminate_event' inequality will catch it.
+                        disconnect_timeout_started = False
+                        # No need to break here; the event inequality check will handle it.
+                    elif time.time() - disconnect_start_time >= RECONNECT_TIMEOUT:
+                        connected_user_monitor = None
+                        for u, c_stat in current_gs_monitor['connected'].items():
+                            if c_stat: connected_user_monitor = u; break
+                        
+                        print(f"[INFO] Supervisor for {game_key}: {disconnected_user_monitor} did not reconnect. {connected_user_monitor or 'Opponent'} wins by forfeit.")
+                        if connected_user_monitor:
+                            try:
+                                other_conn = current_gs_monitor['conns'][connected_user_monitor]
+                                send_packet(other_conn, 0, PKT_TYPE_GAME, "OPPONENT_TIMEOUT. You win!")
+                            except Exception: pass
+                        
+                        this_game_terminate_event.set() # Signal game_thread to stop
+                        game_thread.join(timeout=2.0)
+                        # Mark for deletion in finally block by this active supervisor
+                        current_gs_monitor['game_over_by_forfeit'] = True 
+                        break # Exit supervisor loop to finally block
+            else: # Not waiting_reconnect
+                disconnect_timeout_started = False
+            
+            time.sleep(0.5)
+        # End of supervisor's main while loop
+
+    except Exception as e:
+        print(f"[ERROR] Outer exception in two_player_game for {game_key}: {e}")
+        if games.get(game_key, {}).get('terminate_event') == this_game_terminate_event:
+            this_game_terminate_event.set() # Try to stop its game_thread
+    finally:
+        print(f"[INFO] two_player_game instance for {game_key} (event {this_game_terminate_event}) entering finally.")
+        
+        final_gs_check = games.get(game_key)
+        is_still_active_supervisor = final_gs_check and final_gs_check.get('terminate_event') == this_game_terminate_event
+
+        game_ended_by_this_supervisor = False
+        if is_still_active_supervisor:
+            if not game_thread.is_alive() or final_gs_check.get('game_over_by_forfeit'):
+                game_ended_by_this_supervisor = True
+        
+        if game_ended_by_this_supervisor:
+            print(f"[INFO] Active supervisor for {game_key} (event {this_game_terminate_event}) cleaning up.")
+            # Re-queue logic (simplified, ensure players are valid)
+            players_to_requeue = []
+            was_forfeit = final_gs_check.get('game_over_by_forfeit', False)
+
+            if was_forfeit:
+                for p_user in [username1, username2]:
+                    if final_gs_check['connected'].get(p_user): # Winner by forfeit
+                        p_conn = final_gs_check['conns'].get(p_user)
+                        p_addr = final_gs_check['addrs'].get(p_user)
+                        if p_conn and p_conn.fileno() != -1: players_to_requeue.append((p_conn, p_addr, p_user))
+            else: # Normal end
+                for p_user in [username1, username2]:
+                    # Check current connections from this supervisor's perspective
+                    p_conn = conn1 if p_user == username1 else conn2
+                    p_addr = addr1 if p_user == username1 else addr2
+                    # A player might have disconnected just as game ended, so check fileno
+                    if p_conn and p_conn.fileno() != -1:
+                         players_to_requeue.append((p_conn, p_addr, p_user))
+            
+            with waiting_players_lock:
+                waiting_lines[:] = [item for item in waiting_lines if item[2] not in (username1, username2)]
+                for p_conn, p_addr, p_user in players_to_requeue:
+                     if not any(wl_item[2] == p_user for wl_item in waiting_lines):
+                        waiting_lines.append((p_conn, p_addr, p_user))
+                        print(f"[INFO] Re-queued {p_user} by supervisor for {game_key}.")
+            
+            if game_key in games and games[game_key].get('terminate_event') == this_game_terminate_event:
+                del games[game_key]
+                print(f"[INFO] Game state for {game_key} deleted by its active supervisor.")
+            
+            with player_sessions_lock:
+                if player_sessions.get(username1): player_sessions[username1]['in_game'] = False
+                if player_sessions.get(username2): player_sessions[username2]['in_game'] = False
+            game_running.clear()
+        else:
+            print(f"[INFO] Superseded/Inactive supervisor for {game_key} (event {this_game_terminate_event}) minimal cleanup.")
+            if not this_game_terminate_event.is_set(): this_game_terminate_event.set()
+            if game_thread.is_alive(): game_thread.join(timeout=1.0)
+        
+        print(f"[INFO] two_player_game instance for {game_key} (event {this_game_terminate_event}) finished execution.")
+
+def broadcast_chat(sender_username, message):
+    # Defensive: ensure message is str
+    if isinstance(message, bytes):
+        message = message.decode('utf-8', errors='ignore')
+    
+    print(f"[EVENT] Broadcasting chat message from {sender_username}: '{message}'")
+    print(f"[EVENT] Active connections count: {len(active_connections)}")
+    
+    packet = build_packet(0, PKT_TYPE_CHAT, f"{sender_username}: {message}".encode('utf-8'))
+    with active_connections_lock:
+        # Defensive: remove closed connections
+        to_remove = []
+        for idx, conn in enumerate(active_connections):
+            try:
+                print(f"[EVENT] Sending chat to connection {idx} (fd={conn.fileno() if hasattr(conn, 'fileno') else 'unknown'})")
+                conn.sendall(packet)
+            except Exception as e:
+                print(f"[EVENT] Failed to send chat to connection {idx}: {e}")
+                to_remove.append(conn)
+        
+        for conn in to_remove:
+            print(f"[EVENT] Removing dead connection from active_connections")
+            active_connections.remove(conn)
+
+def recv_packet_handle_chat(conn, username, terminate_event=None): # Added terminate_event
+    """Receive a packet, handle chat packets inline, and return only game packets."""
+    while True:
+        if terminate_event and terminate_event.is_set(): # Check event before blocking
+            raise ConnectionAbortedError(f"recv_packet_handle_chat terminated for {username}")
+        try:
+            seq, pkt_type, payload = recv_packet(conn, terminate_event=terminate_event) # Pass event
+        except ConnectionAbortedError:
+            raise # Propagate if recv_packet was terminated
+        except ConnectionError as e: # Catch disconnects from recv_packet
+            print(f"[EVENT] ConnectionError in recv_packet_handle_chat for {username}: {e}")
+            raise # Re-raise to be handled by caller
+        except Exception as e:
+            print(f"[EVENT] Unexpected Exception in recv_packet_handle_chat's call to recv_packet for {username}: {e}")
+            raise ConnectionError(f"Client {username} disconnected or critical read error")
+        
+        if pkt_type == PKT_TYPE_CHAT:
+            # Defensive: decode payload if it's bytes (for robustness)
+            if isinstance(payload, bytes):
+                payload = payload.decode('utf-8', errors='ignore')
+            
+            if payload is not None and payload.strip() != "":
+                print(f"[EVENT] Received chat message from {username}: '{payload}'")
+                broadcast_chat(username, payload)
+            # else: print(f"[EVENT] Received empty or None chat message from {username}")
+            continue
+        
+        if pkt_type is None or payload is None: # Indicates parse_packet error
+            print(f"[EVENT] Received invalid packet (parse error: type={pkt_type}, payload={payload}) from {username}")
+            raise ConnectionError(f"Invalid packet from {username} (parse error)")
         
         return seq, pkt_type, payload
 
 def game_manager(conn, addr, mode):
-    username, conn, addr = handle_initial_connection(conn, addr)
+    username, conn_after_handshake, addr_after_handshake = handle_initial_connection(conn, addr)
     print(f"[EVENT] game_manager got username: {username}")
     if not username:
         print(f"[EVENT] Username handshake failed for {addr}")
