@@ -17,8 +17,6 @@ import queue
 import struct
 import select  # Add this import
 from battleship import run_single_player_game_online, run_two_player_game_online, Board, BOARD_SIZE, SHIPS
-from protocol.encryption import encrypt_message, decrypt_message
-
 from protocol import build_packet, parse_packet, PKT_TYPE_GAME, PKT_TYPE_CHAT
 
 HOST = '127.0.0.1'
@@ -41,15 +39,14 @@ games = {}  # (username1, username2): { 'board1': ..., 'board2': ..., 'turn': ..
 active_connections = []
 active_connections_lock = threading.Lock()
 
-def send_packet(conn, seq, pkt_type, msg: str):
-    """Send a packet with the given sequence, type, and string payload (encrypted)."""
-    encrypted_string_payload = encrypt_message(msg)  # Encrypt the string message
-    payload_bytes_for_packet = encrypted_string_payload.encode('utf-8')  # Encode the encrypted string to bytes
-    packet = build_packet(seq, pkt_type, payload_bytes_for_packet)
+def send_packet(conn, seq, pkt_type, msg):
+    """Send a packet with the given sequence, type, and string payload."""
+    payload = msg.encode('utf-8')
+    packet = build_packet(seq, pkt_type, payload)
     conn.sendall(packet)
 
 def recv_packet(conn):
-    """Receive a packet and return (seq, pkt_type, payload as decrypted str)."""
+    """Receive a packet and return (seq, pkt_type, payload as str)."""
     # Read header first to get payload length
     header_size = 7  # 4+1+2
     header = b''
@@ -73,15 +70,10 @@ def recv_packet(conn):
         checksum += chunk
     packet = header + payload + checksum
     try:
-        seq, pkt_type, payload_bytes_from_packet = parse_packet(packet) # payload_bytes_from_packet is bytes
-        # Ensure payload_bytes_from_packet is not None before decoding
-        if payload_bytes_from_packet is None:
-            raise ValueError("Received None payload from parse_packet")
-        encrypted_string_payload = payload_bytes_from_packet.decode('utf-8') # Decode bytes to string (Base64)
-        decrypted_msg_string = decrypt_message(encrypted_string_payload) # Decrypt the string
-        return seq, pkt_type, decrypted_msg_string
+        seq, pkt_type, payload = parse_packet(packet)
+        return seq, pkt_type, payload.decode('utf-8')
     except Exception as e:
-        print(f"[PACKET-RECV-ERROR] Error receiving or parsing packet: {e}")
+        # Optionally log or handle checksum error
         return None, None, None
 
 def handle_initial_connection(conn, addr):
@@ -285,8 +277,8 @@ def two_player_game(conn1, addr1, conn2, addr2, username1, username2):
             with waiting_players_lock:
                 for c, a, u in waiting_lines:
                     try:
-                        lobby_wfile = EncryptedWFileWrapper(c.makefile('w'))
-                        lobby_wfile.write(msg)
+                        lobby_wfile = c.makefile('w')
+                        lobby_wfile.write(msg + "\n")
                         lobby_wfile.flush()
                     except Exception:
                         pass
@@ -531,19 +523,14 @@ def broadcast_chat(sender_username, message):
     print(f"[EVENT] Broadcasting chat message from {sender_username}: '{message}'")
     print(f"[EVENT] Active connections count: {len(active_connections)}")
     
-    chat_message_string = f"{sender_username}: {message}"
-    encrypted_chat_string = encrypt_message(chat_message_string) # Encrypt the chat message
-    encrypted_chat_payload_bytes = encrypted_chat_string.encode('utf-8') # Encode to bytes
-    
-    # Using sequence 0 for chat broadcast messages for simplicity
-    packet = build_packet(0, PKT_TYPE_CHAT, encrypted_chat_payload_bytes)
-    
+    packet = build_packet(0, PKT_TYPE_CHAT, f"{sender_username}: {message}".encode('utf-8'))
     with active_connections_lock:
         # Defensive: remove closed connections
         to_remove = []
         for idx, conn in enumerate(active_connections):
             try:
-                print(f"[EVENT] Sending chat to connection {idx} (fd={conn.fileno() if hasattr(conn, 'fileno') else 'unknown'})")
+                fd = conn.fileno() if hasattr(conn, 'fileno') else 'unknown'
+                print(f"[EVENT] Sending chat to connection {idx} (fd={fd})")
                 conn.sendall(packet)
             except Exception as e:
                 print(f"[EVENT] Failed to send chat to connection {idx}: {e}")
@@ -786,9 +773,7 @@ def two_player_game(conn1, addr1, conn2, addr2, username1, username2):
                         lobby_wfile = c.makefile('w')
                         lobby_wfile.write(msg + "\n")
                         lobby_wfile.flush()
-                    except Exception as e:
-                        print(f"[LOBBY_BROADCAST-ERROR] Failed to send to {u} at {a}: {e}")
-                        # Optionally, remove player c from waiting_lines if connection is dead
+                    except Exception:
                         pass
         with player_sessions_lock:
             player_sessions[username1]['in_game'] = True
@@ -1031,13 +1016,7 @@ def broadcast_chat(sender_username, message):
     print(f"[EVENT] Broadcasting chat message from {sender_username}: '{message}'")
     print(f"[EVENT] Active connections count: {len(active_connections)}")
     
-    chat_message_string = f"{sender_username}: {message}"
-    encrypted_chat_string = encrypt_message(chat_message_string) # Encrypt the chat message
-    encrypted_chat_payload_bytes = encrypted_chat_string.encode('utf-8') # Encode to bytes
-    
-    # Using sequence 0 for chat broadcast messages for simplicity
-    packet = build_packet(0, PKT_TYPE_CHAT, encrypted_chat_payload_bytes)
-    
+    packet = build_packet(0, PKT_TYPE_CHAT, f"{sender_username}: {message}".encode('utf-8'))
     with active_connections_lock:
         # Defensive: remove closed connections
         to_remove = []
