@@ -1,4 +1,4 @@
-# CITS3002 BEER Project
+# Battleship Game Project
 
 ## Overview
 This project implements a networked version of the classic Battleship game, allowing for single-player games against the server or two-player games between clients, with features like chat, game state persistence, and player reconnection.
